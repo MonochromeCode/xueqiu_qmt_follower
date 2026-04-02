@@ -62,37 +62,65 @@ def get_session(cookie: str) -> requests.Session:
 def fetch_latest_rb_id(session: requests.Session, portfolio_id: str):
     """
     获取最新调仓记录 ID 及时间戳
-    优先用 v5/current，降级到 history
+    接口优先级：current > v5 > history > snowmart
     """
-    # 方案1：v5 current
-    url = f"{STOCK_BASE}/v5/cube/rebalancing/current.json"
+    # 方案1：新版 current 接口 (xueqiu.com)
+    url1 = f"{BASE_URL}/cubes/rebalancing/current.json"
     try:
-        r = session.get(url, params={"cube_symbol": portfolio_id}, timeout=10)
+        r = session.get(url1, params={"cube_symbol": portfolio_id}, timeout=10)
         if r.status_code == 200:
             d = r.json()
             last_rb = (d.get("data") or {}).get("last_rb") or d.get("last_rb") or {}
             rb_id = last_rb.get("id")
             created = last_rb.get("created_at")
             if rb_id:
-                return rb_id, created, "v5/current", d
+                return rb_id, created, "current", d
     except Exception as e:
-        log.debug(f"v5 接口异常: {e}")
+        log.debug(f"current 接口异常: {e}")
 
-    # 方案2：history（降级）
-    url2 = f"{CUBE_BASE}/rebalancing/history.json"
+    # 方案2：v5 current (stock.xueqiu.com，旧版)
+    url2 = f"{STOCK_BASE}/v5/cube/rebalancing/current.json"
     try:
         r2 = session.get(url2, params={"cube_symbol": portfolio_id, "count": 1, "page": 1}, timeout=10)
         if r2.status_code == 200:
             d2 = r2.json()
-            records = d2.get("list") or []
+            last_rb = (d2.get("data") or {}).get("last_rb") or d2.get("last_rb") or {}
+            rb_id = last_rb.get("id")
+            created = last_rb.get("created_at")
+            if rb_id:
+                return rb_id, created, "v5/current", d2
+    except Exception as e:
+        log.debug(f"v5 接口异常: {e}")
+
+    # 方案3：history 接口
+    url3 = f"{CUBE_BASE}/rebalancing/history.json"
+    try:
+        r3 = session.get(url3, params={"cube_symbol": portfolio_id, "count": 1, "page": 1}, timeout=10)
+        if r3.status_code == 200:
+            d3 = r3.json()
+            records = d3.get("list") or []
             if records:
                 rb_id = records[0].get("id")
                 created = records[0].get("created_at")
-                return rb_id, created, "history", d2
-        else:
-            log.error(f"history 接口返回 {r2.status_code}: {r2.text[:200]}")
+                return rb_id, created, "history", d3
     except Exception as e:
-        log.error(f"history 接口异常: {e}")
+        log.debug(f"history 接口异常: {e}")
+
+    # 方案4：snowmart history (备用)
+    url4 = f"{BASE_URL}/snowmart/cube/rebalancing/history.json"
+    try:
+        r4 = session.get(url4, params={"cube_symbol": portfolio_id, "count": 1, "page": 1}, timeout=10)
+        if r4.status_code == 200:
+            d4 = r4.json()
+            records = d4.get("list") or []
+            if records:
+                rb_id = records[0].get("id")
+                created = records[0].get("created_at")
+                return rb_id, created, "snowmart/history", d4
+        else:
+            log.error(f"所有接口均返回错误，最后一个状态码: {r4.status_code}")
+    except Exception as e:
+        log.error(f"snowmart 接口异常: {e}")
 
     return None, None, "failed", {}
 

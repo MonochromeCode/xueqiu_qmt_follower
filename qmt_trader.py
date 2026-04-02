@@ -37,8 +37,15 @@ except ImportError:
 class _TraderCallback:
     """XtQuantTraderCallback 的简单封装，统一输出日志"""
 
+    def __init__(self, trader_ref=None):
+        # 持有 QMTTrader 弱引用，用于触发重连
+        self._trader_ref = trader_ref
+
     def on_disconnected(self):
         logger.error("【QMT】连接断开！请检查 miniQMT 客户端是否在线")
+        # 通知 QMTTrader 标记断线，由主循环触发重连
+        if self._trader_ref is not None:
+            self._trader_ref._connected = False
 
     def on_stock_order(self, order):
         logger.info(
@@ -101,6 +108,10 @@ class QMTTrader:
         # 当日交易计数
         self._daily_trade_count = 0
 
+        # 重连参数
+        self._reconnect_interval = 30   # 断线后每 30 秒尝试重连一次
+        self._last_reconnect_ts  = 0.0
+
     # ─────────────────────────────────────────────────────────
     # 连接 & 断开
     # ─────────────────────────────────────────────────────────
@@ -124,8 +135,9 @@ class QMTTrader:
 
             # 注册回调
             if HAS_XTQUANT:
+                _cb_self = self   # 闭包捕获
                 cb = type("CB", (XtQuantTraderCallback,), {
-                    "on_disconnected":  _TraderCallback.on_disconnected,
+                    "on_disconnected":  lambda s: _TraderCallback(_cb_self).on_disconnected() or _cb_self.__setattr__("_connected", False),
                     "on_stock_order":   _TraderCallback.on_stock_order,
                     "on_stock_trade":   _TraderCallback.on_stock_trade,
                     "on_order_error":   _TraderCallback.on_order_error,
@@ -242,6 +254,140 @@ class QMTTrader:
         except Exception as e:
             logger.error(f"获取行情 {stock_code} 失败: {e}")
         return None
+
+    def get_tick(self, stock_code: str) -> Optional[Dict]:
+        """
+        获取股票完整 tick 数据（含涨跌停价、昨收等）
+
+        Returns:
+            {
+              "lastPrice":   4.235,
+              "high":        4.30,
+              "low":         4.20,
+              "open":        4.22,
+              "lastClose":   4.20,   # 昨收
+              "upperLimit":  4.62,   # 涨停价（+10%）
+              "lowerLimit":  3.78,   # 跌停价（-10%）
+              "askPrice":    [...],
+              "bidPrice":    [...],
+            }
+            失败返回 None
+        """
+        if self._mock:
+            return {
+                "lastPrice": 10.0,
+                "lastClose": 9.5,
+                "upperLimit": 10.45,
+                "lowerLimit": 8.55,
+                "askPrice": [10.02, 10.03, 10.04, 10.05, 10.06],
+                "bidPrice": [9.98, 9.97, 9.96, 9.95, 9.94],
+            }
+        try:
+            tick = xtdata.get_full_tick([stock_code])
+            if tick and stock_code in tick:
+                return tick[stock_code]
+        except Exception as e:
+            logger.error(f"获取 tick {stock_code} 失败: {e}")
+        return None
+
+    def get_ask_price(self, stock_code: str) -> Optional[float]:
+        """
+        获取卖一价（askPrice[0]）。
+        买入时使用：确保以卖方最低报价成交，不会买贵。
+        """
+        tick = self.get_tick(stock_code)
+        if tick is None:
+            return None
+        ask_list = tick.get("askPrice")
+        if ask_list and len(ask_list) > 0:
+            return float(ask_list[0])
+        # fallback 到最新价
+        return float(tick.get("lastPrice") or 0) or None
+
+    def get_bid_price(self, stock_code: str) -> Optional[float]:
+        """
+        获取买一价（bidPrice[0]）。
+        卖出时使用：确保以买方最高报价成交，不会卖便宜。
+        """
+        tick = self.get_tick(stock_code)
+        if tick is None:
+            return None
+        bid_list = tick.get("bidPrice")
+        if bid_list and len(bid_list) > 0:
+            return float(bid_list[0])
+        # fallback 到最新价
+        return float(tick.get("lastPrice") or 0) or None
+
+    def is_limit_up(self, stock_code: str) -> bool:
+        """
+        判断股票是否已涨停（最新价 >= 涨停价）
+
+        涨停价判断规则：
+          - tick 中有 upperLimit 字段时，直接比较
+          - 没有时，用昨收 × 1.10 估算（普通股票10%）
+          - 科创板/创业板（688/300开头）× 1.20
+          - ST股票（标识含"ST"）× 1.05
+
+        Returns:
+            True  — 已涨停，不宜追买
+            False — 未涨停
+        """
+        tick = self.get_tick(stock_code)
+        if tick is None:
+            return False
+
+        last_price   = float(tick.get("lastPrice") or 0)
+        upper_limit  = float(tick.get("upperLimit") or 0)
+        last_close   = float(tick.get("lastClose") or 0)
+
+        if last_price <= 0:
+            return False
+
+        if upper_limit > 0:
+            return last_price >= upper_limit * 0.999   # 留0.1%容差
+
+        # 无涨停价字段，自行估算
+        if last_close > 0:
+            code_num = stock_code.split(".")[0]
+            if code_num.startswith("688") or code_num.startswith("300"):
+                estimated_limit = last_close * 1.20
+            else:
+                estimated_limit = last_close * 1.10
+            return last_price >= estimated_limit * 0.999
+
+        return False
+
+    def is_limit_down(self, stock_code: str) -> bool:
+        """
+        判断股票是否已跌停（最新价 <= 跌停价）
+
+        Returns:
+            True  — 已跌停，不宜下卖单
+            False — 未跌停
+        """
+        tick = self.get_tick(stock_code)
+        if tick is None:
+            return False
+
+        last_price  = float(tick.get("lastPrice") or 0)
+        lower_limit = float(tick.get("lowerLimit") or 0)
+        last_close  = float(tick.get("lastClose") or 0)
+
+        if last_price <= 0:
+            return False
+
+        if lower_limit > 0:
+            return last_price <= lower_limit * 1.001   # 留0.1%容差
+
+        if last_close > 0:
+            code_num = stock_code.split(".")[0]
+            if code_num.startswith("688") or code_num.startswith("300"):
+                estimated_limit = last_close * 0.80
+            else:
+                estimated_limit = last_close * 0.90
+            return last_price <= estimated_limit * 1.001
+
+        return False
 
     # ─────────────────────────────────────────────────────────
     # 计算下单量
@@ -466,6 +612,42 @@ class QMTTrader:
         except Exception as e:
             logger.error(f"全部撤单异常: {e}")
 
+    def wait_until_all_cancelled(self, timeout: float = 5.0, interval: float = 0.3,
+                                  stock_code: Optional[str] = None) -> bool:
+        """
+        等待直到可撤委托都被撤销（轮询确认），避免盲等固定秒数。
+
+        Args:
+            timeout:     最长等待秒数，超时后返回 False
+            interval:    每次轮询间隔（秒）
+            stock_code:  指定股票代码过滤；None = 等待所有委托撤完
+
+        Returns:
+            True  — 全部撤单已确认
+            False — 超时仍有残留委托
+        """
+        if self._mock:
+            return True
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = self.get_pending_orders(stock_code=stock_code)
+            if not remaining:
+                scope = stock_code or "全部"
+                logger.debug(f"撤单确认：{scope} 委托已撤销")
+                return True
+            logger.debug(f"撤单确认：仍有 {len(remaining)} 笔委托未撤，继续等待...")
+            time.sleep(interval)
+        remaining = self.get_pending_orders(stock_code=stock_code)
+        if remaining:
+            scope = stock_code or "全部"
+            logger.warning(
+                f"撤单等待超时（{timeout}s）[{scope}]，仍有 {len(remaining)} 笔委托：\n"
+                + "\n".join(f"  {o['stock_code']} {o['order_type']} {o['order_volume']}股 order_id={o['order_id']}"
+                            for o in remaining)
+            )
+            return False
+        return True
+
     def get_pending_orders(self, stock_code: Optional[str] = None) -> List[Dict]:
         """
         查询未成交（可撤）委托列表
@@ -565,3 +747,38 @@ class QMTTrader:
 
     def reset_daily_count(self):
         self._daily_trade_count = 0
+
+    def reconnect_if_needed(self) -> bool:
+        """
+        若当前连接已断开，尝试重连（有冷却时间保护，避免频繁重连）。
+
+        Returns:
+            True  — 当前已连接（无需重连 或 重连成功）
+            False — 仍未连接
+        """
+        if self._mock:
+            return True
+        if self._connected:
+            return True
+
+        now_ts = time.time()
+        if now_ts - self._last_reconnect_ts < self._reconnect_interval:
+            return False   # 还在冷却期
+
+        self._last_reconnect_ts = now_ts
+        logger.warning(f"【重连】检测到 QMT 断线，尝试重新连接...")
+
+        # 先清理旧对象
+        try:
+            if self._trader:
+                self._trader.stop()
+        except Exception:
+            pass
+        self._trader = None
+
+        ok = self.connect()
+        if ok:
+            logger.info("【重连】QMT 重连成功")
+        else:
+            logger.error("【重连】QMT 重连失败，将在下次循环再试")
+        return ok

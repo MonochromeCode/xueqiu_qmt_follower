@@ -34,6 +34,57 @@ BASE_URL    = "https://xueqiu.com"
 CUBE_BASE   = "https://xueqiu.com/cubes"
 STOCK_BASE  = "https://stock.xueqiu.com"   # v5 接口域名
 
+# ── Cookie 过期告警（每 10 分钟最多告警一次，避免刷屏）──────
+_last_cookie_alert_ts: float = 0.0
+_COOKIE_ALERT_INTERVAL = 600  # 秒
+
+
+def _alert_cookie_expired():
+    """Cookie 失效时输出高优先级日志，并可扩展钉钉/企微告警"""
+    global _last_cookie_alert_ts
+    now_ts = time.time()
+    if now_ts - _last_cookie_alert_ts < _COOKIE_ALERT_INTERVAL:
+        return
+    _last_cookie_alert_ts = now_ts
+
+    msg = (
+        "⚠️  【雪球 Cookie 已失效】\n"
+        "   请重新登录雪球，从 DevTools → Network → Request Headers 获取最新 Cookie，\n"
+        "   更新到 config.py 的 XUEQIU_COOKIE 后重启程序。\n"
+        "   在 Cookie 更新前，跟单功能将无法正常工作！"
+    )
+    logger.critical(msg)
+
+    # ── 可选：钉钉告警（填写 webhook 后取消注释）──────────────
+    # _send_dingtalk(msg)
+
+    # ── 可选：企业微信机器人（填写 webhook 后取消注释）──────────
+    # _send_wecom(msg)
+
+
+def _send_dingtalk(text: str):
+    """发送钉钉机器人告警（需在 config.py 配置 DINGTALK_WEBHOOK）"""
+    try:
+        import config as _cfg
+        webhook = getattr(_cfg, "DINGTALK_WEBHOOK", "")
+        if not webhook:
+            return
+        requests.post(webhook, json={"msgtype": "text", "text": {"content": text}}, timeout=5)
+    except Exception:
+        pass
+
+
+def _send_wecom(text: str):
+    """发送企业微信机器人告警（需在 config.py 配置 WECOM_WEBHOOK）"""
+    try:
+        import config as _cfg
+        webhook = getattr(_cfg, "WECOM_WEBHOOK", "")
+        if not webhook:
+            return
+        requests.post(webhook, json={"msgtype": "text", "text": {"content": text}}, timeout=5)
+    except Exception:
+        pass
+
 
 class XueqiuClient:
     """雪球组合数据客户端"""
@@ -80,9 +131,12 @@ class XueqiuClient:
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP 错误 {e.response.status_code}: {url}")
-            if e.response.status_code == 401:
-                logger.error("Cookie 已失效，请更新 config.py 中的 XUEQIU_COOKIE")
+            status = e.response.status_code
+            logger.error(f"HTTP 错误 {status}: {url}")
+            if status == 401:
+                _alert_cookie_expired()
+            elif status == 403:
+                logger.error("403 Forbidden：可能触发雪球反爬，建议降低轮询频率或更换 Cookie")
         except requests.exceptions.RequestException as e:
             logger.error(f"请求异常: {url} -> {e}")
         return None
@@ -306,6 +360,7 @@ class XueqiuClient:
         except Exception as e:
             logger.error(f"解析调仓通知失败: {e}")
             return False
+
 
 
 # ─────────────────────────────────────────────────────────────
