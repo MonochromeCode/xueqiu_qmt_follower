@@ -400,6 +400,11 @@ def _to_qmt_code(raw_code: str) -> str:
             return f"{code}.SZ"
         elif code.startswith(("8", "4")):
             return f"{code}.BJ"
+        # 可转债：沪市 11xxxx → .SH，深市 12xxxx → .SZ
+        elif code.startswith("11"):
+            return f"{code}.SH"
+        elif code.startswith("12"):
+            return f"{code}.SZ"
 
     # 港股：纯5位数字
     if code.isdigit() and len(code) == 5:

@@ -537,6 +537,8 @@ class XueqiuFollower:
         total_amount = getattr(config, "TOTAL_AMOUNT", 100000.0)
         threshold    = getattr(config, "REBALANCE_THRESHOLD", 0.02)
 
+        logger.info(f"  跟单基准金额：¥{total_amount:,.0f}（来自 config.TOTAL_AMOUNT）")
+
         # ── 1. 雪球目标持仓 ────────────────────────────────
         xq_positions = self.xq.get_current_positions()
         if not xq_positions:
@@ -628,16 +630,20 @@ class XueqiuFollower:
         # 避免可用现金不足时多笔买单全部失败
         if buy_orders:
             available_cash = self.trader.get_cash()
+            # 预留 MIN_CASH_RATIO 的保留金，不全部投入买入
+            reserved_cash = total_amount * getattr(config, "MIN_CASH_RATIO", 0.05)
+            spendable_cash = max(0, available_cash - reserved_cash)
             total_buy_needed = sum(amt for _, amt in buy_orders)
 
-            if total_buy_needed > 0 and available_cash < total_buy_needed:
+            if total_buy_needed > 0 and spendable_cash < total_buy_needed:
                 logger.warning(
-                    f"  可用现金=¥{available_cash:,.0f}  买入需求=¥{total_buy_needed:,.0f}  "
+                    f"  可用现金=¥{available_cash:,.0f}  保留金=¥{reserved_cash:,.0f}  "
+                    f"可买入=¥{spendable_cash:,.0f}  买入需求=¥{total_buy_needed:,.0f}  "
                     f"现金不足，按比例缩减各买单"
                 )
-                # 按各买单占总需求的比例分配可用现金
+                # 按各买单占总需求的比例分配可买入现金
                 adjusted_buy_orders = [
-                    (code, available_cash * (amt / total_buy_needed))
+                    (code, spendable_cash * (amt / total_buy_needed))
                     for code, amt in buy_orders
                 ]
             else:
@@ -701,21 +707,32 @@ class XueqiuFollower:
                     f"但继续执行（旧挂单由 QMT 兜底：可用量校验）"
                 )
 
-        price = self.trader.get_latest_price(code)
-        if price is None:
-            logger.error(f"买入 {code}: 无法获取最新价，跳过")
-            return "skip"
-
+        # ── 价格获取：买入使用卖一价（对手价），在 trader.buy() 内部处理 ──
         # 涨停保护：涨停时不追买
         if config.LIMIT_PROTECTION and self.trader.is_limit_up(code):
             logger.warning(f"【风控-涨停】{code} 当前已涨停，跳过买入（等下个交易日）")
             return "skip"
 
+        # ── 预估买入张数：不足一手则跳过（避免可转债等品种下单失败）──
+        est_price = self.trader.get_latest_price(code)
+        if est_price is None or est_price <= 0:
+            logger.error(f"买入 {code}: 无法获取价格，跳过")
+            return "skip"
+        lot = self.trader.get_lot_size(code)
+        est_vol = int(amount / est_price // lot) * lot
+        if est_vol <= 0:
+            logger.info(
+                f"【按比例买入】{code}  目标金额=¥{amount:,.0f}  "
+                f"预估{est_vol}{'张' if lot==10 else '股'}，不足{lot}手，跳过"
+            )
+            return "skip"
+
         logger.info(f"【按比例买入】{code}  目标金额=¥{amount:,.0f}")
+        # price=None → trader.buy() 内部自动获取卖一价（对手价），确保快速成交
         order_id = self.trader.buy(
             stock_code=code,
             amount=amount,
-            price=price,
+            price=None,
             remark=f"雪球比例跟单-{config.PORTFOLIO_ID}",
         )
         if order_id is not None and order_id > 0:
@@ -774,11 +791,14 @@ class XueqiuFollower:
             logger.warning(f"卖出 {code}: 可用股数=0（T+0限制），跳过")
             return "skip"
 
-        price = self.trader.get_latest_price(code)
+        # 卖出使用买一价（对手价），确保快速成交
+        price = self.trader.get_bid_price(code)
+        if price is None or price <= 0:
+            price = self.trader.get_latest_price(code)
         if price is None or price <= 0:
             price = pos.get("open_price", 0)
         if price <= 0:
-            logger.error(f"卖出 {code}: 无法获取最新价，跳过")
+            logger.error(f"卖出 {code}: 无法获取价格，跳过")
             return "skip"
 
         # 跌停保护：跌停时不下卖单（次日再处理）
@@ -794,19 +814,19 @@ class XueqiuFollower:
             # 超出或等于可用量 → 全部清仓
             sell_volume = can_use
             logger.info(
-                f"【按比例卖出】{code}  全部卖出 {sell_volume}股 @ {price:.3f}"
+                f"【按比例卖出】{code}  全部卖出 {sell_volume}{'张' if self.trader.get_lot_size(code)==10 else '股'} @ {price:.3f}"
                 f"  目标减少≈¥{sell_amount:,.0f}（超出/等于可用持仓，清仓）"
             )
         elif sell_volume < lot:
-            # 不足一手 → 取1手，若持仓本身不足一手则全部卖出
-            sell_volume = min(lot, can_use)
+            # 不足一手 → 跳过（避免"多卖"导致持仓偏离；下次再平衡时偏差累积超阈值再处理）
             logger.info(
-                f"【按比例卖出】{code}  比例不足一手({lot}张/股)，取1手 {sell_volume}股 @ {price:.3f}"
-                f"  目标减少≈¥{sell_amount:,.0f}"
+                f"【按比例卖出】{code}  差值不足一手({lot}{'张' if lot==10 else '股'})，"
+                f"跳过本次微调  目标减少≈¥{sell_amount:,.0f}"
             )
+            return "skip"
         else:
             logger.info(
-                f"【按比例卖出】{code}  {sell_volume}股 @ {price:.3f}"
+                f"【按比例卖出】{code}  {sell_volume}{'张' if self.trader.get_lot_size(code)==10 else '股'} @ {price:.3f}"
                 f"  卖出金额≈¥{sell_volume*price:,.0f}  目标减少≈¥{sell_amount:,.0f}"
             )
 
@@ -834,7 +854,7 @@ class XueqiuFollower:
     # ─────────────────────────────────────────────────────────
     # 挂单追踪：30 秒未成交撤单按最新价重下
     # ─────────────────────────────────────────────────────────
-    _CHASE_INTERVAL = 30   # 检查间隔（秒）
+    _CHASE_INTERVAL = 10   # 检查间隔（秒）：10s未成交即撤单重下对手价
 
     def _chase_unfinished_orders(self):
         """
@@ -886,10 +906,13 @@ class XueqiuFollower:
 
             to_remove.append(oid)
 
-            # 重新下单
-            new_price = self.trader.get_latest_price(code)
+            # 重新下单：买入用卖一价，卖出用买一价（对手价，确保快速成交）
+            new_price = self.trader.get_ask_price(code) if direction == "BUY" else self.trader.get_bid_price(code)
             if new_price is None or new_price <= 0:
-                logger.error(f"【追单】{code} 无法获取最新价，放弃重下")
+                # fallback 到最新价
+                new_price = self.trader.get_latest_price(code)
+            if new_price is None or new_price <= 0:
+                logger.error(f"【追单】{code} 无法获取价格，放弃重下")
                 continue
 
             if direction == "BUY":

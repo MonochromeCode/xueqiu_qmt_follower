@@ -404,6 +404,22 @@ class QMTTrader:
             return 10
         return 100
 
+    @staticmethod
+    def is_cb(stock_code: str) -> bool:
+        """判断是否为可转债（沪市 11xxxx / 深市 12xxxx）"""
+        prefix = stock_code[:2]
+        return prefix in ("11", "12")
+
+    def _get_cb_offset(self, direction: str) -> float:
+        """从 config 读取可转债价格偏移量（默认 0.002 = 0.2%）"""
+        try:
+            if direction == "BUY":
+                return float(getattr(config, "CB_BUY_OFFSET", 0.002))
+            else:  # SELL
+                return float(getattr(config, "CB_SELL_OFFSET", 0.002))
+        except Exception:
+            return 0.002   # 兜底默认值 0.2%
+
     # ─────────────────────────────────────────────────────────
     # 计算下单量
     # ─────────────────────────────────────────────────────────
@@ -451,10 +467,18 @@ class QMTTrader:
             order_id（int > 0 = 成功，-1 = 失败，None = 模拟）
         """
         if price is None:
-            price = self.get_latest_price(stock_code)
+            # 买入使用卖一价（对手价）：主动吃卖单，优先成交
+            # 若卖一价不可用，fallback 到最新价
+            ask = self.get_ask_price(stock_code)
+            price = ask if ask else self.get_latest_price(stock_code)
             if price is None:
-                logger.error(f"买入失败: 无法获取 {stock_code} 最新价")
+                logger.error(f"买入失败: 无法获取 {stock_code} 价格")
                 return -1
+            # 可转债：流动性差时卖一价偏高，加偏移确保成交
+            if self.is_cb(stock_code):
+                offset = self._get_cb_offset("BUY")
+                price = price * (1 + offset)
+                logger.debug(f"【可转债买入偏移】{stock_code} 卖一价={ask:.4f} → {price:.4f} (×{1+offset:.4f})")
 
         volume = self.calc_buy_volume(amount, price, min_lot=self.get_lot_size(stock_code))
         if volume <= 0:
@@ -464,7 +488,7 @@ class QMTTrader:
         actual_amount = volume * price
         logger.info(
             f"【买入】{stock_code} "
-            f"金额={amount:.0f}元 → {volume}股 @ {price:.3f} "
+            f"金额={amount:.0f}元 → {volume}股 @ {price:.3f}(卖一价) "
             f"实际金额≈{actual_amount:.0f}元 [{remark}]"
         )
 
@@ -530,14 +554,22 @@ class QMTTrader:
         sell_volume = min(sell_volume, can_use)  # 不超过可用量
 
         if price is None:
-            price = self.get_latest_price(stock_code)
+            # 卖出使用买一价（对手价）：主动吃买单，优先成交
+            # 若买一价不可用，fallback 到最新价
+            bid = self.get_bid_price(stock_code)
+            price = bid if bid else self.get_latest_price(stock_code)
             if price is None:
-                logger.error(f"卖出失败: 无法获取 {stock_code} 最新价")
+                logger.error(f"卖出失败: 无法获取 {stock_code} 价格")
                 return -1
+            # 可转债：流动性差时买一价偏低，减偏移确保成交
+            if self.is_cb(stock_code):
+                offset = self._get_cb_offset("SELL")
+                price = price * (1 - offset)
+                logger.debug(f"【可转债卖出偏移】{stock_code} 买一价={bid:.4f} → {price:.4f} (×{1-offset:.4f})")
 
         logger.info(
             f"【卖出】{stock_code} "
-            f"{sell_volume}股 @ {price:.3f} "
+            f"{sell_volume}股 @ {price:.3f}(买一价) "
             f"预计金额≈{sell_volume * price:.0f}元 [{remark}]"
         )
 
