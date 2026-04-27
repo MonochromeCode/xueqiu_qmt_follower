@@ -349,7 +349,10 @@ class QMTTrader:
         # 无涨停价字段，自行估算
         if last_close > 0:
             code_num = stock_code.split(".")[0]
-            if code_num.startswith("688") or code_num.startswith("300"):
+            if code_num.startswith(("11", "12")):
+                # 可转债：涨跌幅限制 ±20%
+                estimated_limit = last_close * 1.20
+            elif code_num.startswith("688") or code_num.startswith("300"):
                 estimated_limit = last_close * 1.20
             else:
                 estimated_limit = last_close * 1.10
@@ -381,7 +384,10 @@ class QMTTrader:
 
         if last_close > 0:
             code_num = stock_code.split(".")[0]
-            if code_num.startswith("688") or code_num.startswith("300"):
+            if code_num.startswith(("11", "12")):
+                # 可转债：涨跌幅限制 ±20%
+                estimated_limit = last_close * 0.80
+            elif code_num.startswith("688") or code_num.startswith("300"):
                 estimated_limit = last_close * 0.80
             else:
                 estimated_limit = last_close * 0.90
@@ -419,6 +425,18 @@ class QMTTrader:
                 return float(getattr(config, "CB_SELL_OFFSET", 0.002))
         except Exception:
             return 0.002   # 兜底默认值 0.2%
+
+    @staticmethod
+    def align_price(price: float, stock_code: str) -> float:
+        """
+        对齐价格精度，确保符合交易所最小价差要求。
+
+        - 可转债（11/12开头）：最小价差 0.001元，但交易所校验按"分"（0.01元）
+          → round 到 2 位小数
+        - A股：最小价差 0.01元（分）→ round 到 2 位小数
+        - 实际上所有品种 round(2) 即可满足要求
+        """
+        return round(price, 2)
 
     # ─────────────────────────────────────────────────────────
     # 计算下单量
@@ -475,10 +493,15 @@ class QMTTrader:
                 logger.error(f"买入失败: 无法获取 {stock_code} 价格")
                 return -1
             # 可转债：流动性差时卖一价偏高，加偏移确保成交
+            # 偏移后必须 round 到2位小数（分），否则交易所校验最小价差失败（废单）
             if self.is_cb(stock_code):
                 offset = self._get_cb_offset("BUY")
-                price = price * (1 + offset)
-                logger.debug(f"【可转债买入偏移】{stock_code} 卖一价={ask:.4f} → {price:.4f} (×{1+offset:.4f})")
+                base_price = price   # 记录偏移前的价格（ask 可能已被替换为 lastPrice）
+                price = round(price * (1 + offset), 2)
+                logger.debug(f"【可转债买入偏移】{stock_code} 对手价={base_price:.3f} → {price:.3f} (×{1+offset:.4f})")
+
+        # 统一对齐价格精度（round 到分，避免交易所校验最小价差失败）
+        price = self.align_price(price, stock_code)
 
         volume = self.calc_buy_volume(amount, price, min_lot=self.get_lot_size(stock_code))
         if volume <= 0:
@@ -562,10 +585,15 @@ class QMTTrader:
                 logger.error(f"卖出失败: 无法获取 {stock_code} 价格")
                 return -1
             # 可转债：流动性差时买一价偏低，减偏移确保成交
+            # 偏移后必须 round 到2位小数（分），否则交易所校验最小价差失败（废单）
             if self.is_cb(stock_code):
                 offset = self._get_cb_offset("SELL")
-                price = price * (1 - offset)
-                logger.debug(f"【可转债卖出偏移】{stock_code} 买一价={bid:.4f} → {price:.4f} (×{1-offset:.4f})")
+                base_price = price   # 记录偏移前的价格（bid 可能已被替换为 lastPrice）
+                price = round(price * (1 - offset), 2)
+                logger.debug(f"【可转债卖出偏移】{stock_code} 对手价={base_price:.3f} → {price:.3f} (×{1-offset:.4f})")
+
+        # 统一对齐价格精度（round 到分，避免交易所校验最小价差失败）
+        price = self.align_price(price, stock_code)
 
         logger.info(
             f"【卖出】{stock_code} "

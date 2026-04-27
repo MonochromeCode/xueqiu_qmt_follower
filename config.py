@@ -5,7 +5,7 @@
 # ────────────────────────────────────────────
 # 1. QMT 交易端配置
 # ────────────────────────────────────────────
-QMT_PATH = r"C:\xxxxxxx\userdata_mini"   # ← 改为你的 QMT 安装路径
+QMT_PATH = r"C:\东北证券NET专业版(测试版)\userdata_mini"   # ← 改为你的 QMT 安装路径
 ACCOUNT_ID = "10107454"                           # ← 改为你的资金账号
 ACCOUNT_TYPE = "STOCK"                              # 普通股票账户
 
@@ -13,12 +13,12 @@ ACCOUNT_TYPE = "STOCK"                              # 普通股票账户
 # 2. 雪球组合配置
 # ────────────────────────────────────────────
 # 要跟踪的雪球组合代码（如 ZH123456）
-PORTFOLIO_ID = "ZHxxxxx"                           # ← 改为目标组合 ID
+PORTFOLIO_ID = "ZH3375064"                           # ← 改为目标组合 ID
 # PORTFOLIO_ID = "ZH3605259"                           # ← 改为目标组合 ID
 
 # 雪球 Cookie（登录后从浏览器 DevTools → Network → 任意请求 → Request Headers 获取）
 # 必须填写，否则无法访问组合数据
-XUEQIU_COOKIE = "xq_a_token=xxxxxxxx"       # ← 改为你的雪球 Cookie
+XUEQIU_COOKIE = "xq_a_token=f8d63013885065121287cfc8cab36f4262b00fc4"       # ← 改为你的雪球 Cookie
 
 # ────────────────────────────────────────────
 # 3. 交易策略配置
@@ -37,6 +37,10 @@ TOTAL_AMOUNT = 20000.0
 # 再平衡触发阈值：某只股票实际市值偏离目标市值超过此比例才调整
 # 0.02 = 偏差 2% 以上才下单（避免因行情微波动频繁下单）
 REBALANCE_THRESHOLD = 0.02
+# 再平衡绝对金额门槛（元）：偏差绝对值低于此值时也忽略（兜底）
+# 可转债一手约 1000 元，设 200 元意味着偏差不足 1/5 手时不处理
+# 如果想更灵敏可调小到 100；想减少频繁调仓可调大到 500
+REBALANCE_ABS_THRESHOLD = 200.0
 
 # ── fixed_amount 模式专用（ratio_follow 模式下不生效）──────
 # 每笔买入固定金额（元）
@@ -88,11 +92,20 @@ LOG_LEVEL = "INFO"   # DEBUG / INFO / WARNING / ERROR
 # 非交易时间检测雪球撤单的轮询间隔（秒）
 OFFHOUR_CANCEL_INTERVAL = 300
 
+# ── 可转债价格偏移 ──────────────────────────────────────────────
+# 可转债流动性差时，卖一/买一价可能偏高或偏低，
+# 偏移量 = 基础对手价 × (1 + offset)，确保下单能快速成交
+# CB_BUY_OFFSET：买入时在卖一价基础上加此比例（正值表示接受稍高价格）
+# CB_SELL_OFFSET：卖出时在买一价基础上减此比例（正值表示接受稍低价格）
+# 0.001 = 0.1%，适合小资金量；0.005 = 0.5%，适合追求快速成交
+CB_BUY_OFFSET = 0.002
+CB_SELL_OFFSET = 0.002
+
 # 程序状态持久化文件路径（保存 last_rebalancing_id，重启后不重复下单）
 STATE_FILE = "./state.json"
 
 # ── 可选：告警 Webhook（填写后 Cookie 失效等异常会自动推送）──
 # 钉钉机器人 Webhook（留空则不推送）
-DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=sxxxxx"
+DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=d197cbdb74823177f99a6a8d3e84464dadd52345e3ff84dcb9fb9780c8d557bb"
 # 企业微信机器人 Webhook（留空则不推送）
 WECOM_WEBHOOK = ""

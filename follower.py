@@ -563,13 +563,24 @@ class XueqiuFollower:
             code   = p["stock_code"]
             target[code] = total_amount * (p["weight"] / 100.0)
 
-        # ── 2. QMT 当前持仓市值 ────────────────────────────
+        # ── 2. QMT 当前持仓市值（实时价 × 持仓量）──────────
+        # 注意：不使用 pos.market_value（QMT 该字段可能是昨收价快照，盘中不实时）
+        # 改为：实时行情价 × 持仓量，确保差值计算基于当前市场价格
         qmt_positions = self.trader.get_positions()
-        # {stock_code: market_value}
         current_value: Dict[str, float] = {}
         for code, pos in qmt_positions.items():
-            mv = pos.get("market_value") or 0.0
-            current_value[code] = float(mv)
+            volume = int(pos.get("volume") or 0)
+            if volume <= 0:
+                continue
+            real_price = self.trader.get_latest_price(code)
+            if real_price and real_price > 0:
+                current_value[code] = real_price * volume
+            else:
+                # 行情获取失败时，降级用 market_value（避免全部被当成 0 处理）
+                mv = pos.get("market_value") or 0.0
+                current_value[code] = float(mv)
+                if mv > 0:
+                    logger.warning(f"  {code} 无法获取实时价，降级用 market_value={mv:.0f}")
 
         # ── 3. 计算差值 ────────────────────────────────────
         all_codes = set(target.keys()) | set(current_value.keys())
@@ -585,6 +596,10 @@ class XueqiuFollower:
         logger.info(f"  {'代码':<12} {'目标市值':>10} {'当前市值':>10} {'差值':>10}  操作")
         logger.info("  " + "-" * 55)
 
+        # 绝对金额门槛：可转债一手约 100×10=1000 元，股票一手约 100×price
+        # 偏差绝对值低于此值时也忽略（兜底，防止小偏差反复触发但又买不到一手）
+        abs_threshold = getattr(config, "REBALANCE_ABS_THRESHOLD", 200.0)
+
         for code in sorted(all_codes):
             tgt = target.get(code, 0.0)
             cur = current_value.get(code, 0.0)
@@ -594,9 +609,11 @@ class XueqiuFollower:
             if tgt == 0:
                 continue
 
-            # 忽略微小偏差
-            if tgt > 0 and abs(diff) / tgt < threshold:
-                logger.info(f"  {code:<12} {tgt:>10,.0f} {cur:>10,.0f} {diff:>+10,.0f}  忽略(偏差<{threshold*100:.0f}%)")
+            # 忽略微小偏差：比例 AND 绝对金额都在阈值内才忽略
+            ratio_ok = tgt > 0 and abs(diff) / tgt < threshold
+            abs_ok   = abs(diff) < abs_threshold
+            if ratio_ok and abs_ok:
+                logger.info(f"  {code:<12} {tgt:>10,.0f} {cur:>10,.0f} {diff:>+10,.0f}  忽略(偏差<{threshold*100:.0f}% 且<¥{abs_threshold:.0f})")
                 continue
 
             if diff > 0:
@@ -818,12 +835,20 @@ class XueqiuFollower:
                 f"  目标减少≈¥{sell_amount:,.0f}（超出/等于可用持仓，清仓）"
             )
         elif sell_volume < lot:
-            # 不足一手 → 跳过（避免"多卖"导致持仓偏离；下次再平衡时偏差累积超阈值再处理）
-            logger.info(
-                f"【按比例卖出】{code}  差值不足一手({lot}{'张' if lot==10 else '股'})，"
-                f"跳过本次微调  目标减少≈¥{sell_amount:,.0f}"
-            )
-            return "skip"
+            if can_use <= lot:
+                # 持仓本身不足一手（碎股）→ 强制全部卖出，彻底清仓对齐比例
+                sell_volume = can_use
+                logger.info(
+                    f"【按比例卖出】{code}  持仓碎股({can_use}{'张' if lot==10 else '股'}<{lot}手)，"
+                    f"强制清仓  目标减少≈¥{sell_amount:,.0f}"
+                )
+            else:
+                # 持仓充足，但差值不足一手 → 跳过（等下次差值积累超阈值再处理）
+                logger.info(
+                    f"【按比例卖出】{code}  差值不足一手({lot}{'张' if lot==10 else '股'})，"
+                    f"跳过本次微调  目标减少≈¥{sell_amount:,.0f}"
+                )
+                return "skip"
         else:
             logger.info(
                 f"【按比例卖出】{code}  {sell_volume}{'张' if self.trader.get_lot_size(code)==10 else '股'} @ {price:.3f}"
