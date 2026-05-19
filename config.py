@@ -6,7 +6,7 @@
 # 1. QMT 交易端配置
 # ────────────────────────────────────────────
 QMT_PATH = r"C:\东北证券NET专业版(测试版)\userdata_mini"   # ← 改为你的 QMT 安装路径
-ACCOUNT_ID = "1222223"                           # ← 改为你的资金账号
+ACCOUNT_ID = "xxxx"                           # ← 改为你的资金账号
 ACCOUNT_TYPE = "STOCK"                              # 普通股票账户
 
 # ────────────────────────────────────────────
@@ -109,6 +109,6 @@ STATE_FILE = "./state.json"
 
 # ── 可选：告警 Webhook（填写后 Cookie 失效等异常会自动推送）──
 # 钉钉机器人 Webhook（留空则不推送）
-DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=xxxx"
+DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=d197cbdb74823177f99a6a8d3e84464dadd52345e3ff84dcb9fb978xxxx"
 # 企业微信机器人 Webhook（留空则不推送）
 WECOM_WEBHOOK = ""
