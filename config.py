@@ -33,7 +33,10 @@ TRADE_MODE = "ratio_follow"
 # 账户总资产 × 雪球各股权重 = 每只股票目标持仓市值，完全与雪球比例对齐。
 # 例如：账户总资产 12 万，某股权重 30% → 目标市值 3.6 万
 #       雪球各股合计 90%（现金 10%） → 目标现金 1.2 万
-TOTAL_AMOUNT = 20000.0
+#
+# TOTAL_AMOUNT 仅作为 fallback：当 QMT 未连接或 query_stock_asset 返回 0 时使用。
+# 正常运行下 TOTAL_AMOUNT 不参与计算。
+TOTAL_AMOUNT = 88888888.0
 # 再平衡触发阈值：某只股票实际市值偏离目标市值超过此比例才调整
 # 0.02 = 偏差 2% 以上才下单（避免因行情微波动频繁下单）
 REBALANCE_THRESHOLD = 0.02
