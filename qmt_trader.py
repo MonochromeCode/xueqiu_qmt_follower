@@ -112,6 +112,9 @@ class QMTTrader:
         self._reconnect_interval = 30   # 断线后每 30 秒尝试重连一次
         self._last_reconnect_ts  = 0.0
 
+        # ST 股票名称缓存（避免重复调用 xtdata.get_instrument_detail）
+        self._st_cache: Dict[str, bool] = {}
+
     # ─────────────────────────────────────────────────────────
     # 连接 & 断开
     # ─────────────────────────────────────────────────────────
@@ -352,8 +355,12 @@ class QMTTrader:
             if code_num.startswith(("11", "12")):
                 # 可转债：涨跌幅限制 ±20%
                 estimated_limit = last_close * 1.20
-            elif code_num.startswith("688") or code_num.startswith("300"):
+            elif code_num.startswith(("300", "301", "688")):
+                # 创业板（300/301）、科创板（688）：±20%
                 estimated_limit = last_close * 1.20
+            elif self.is_st(stock_code):
+                # ST/*ST：±5%
+                estimated_limit = last_close * 1.05
             else:
                 estimated_limit = last_close * 1.10
             return last_price >= estimated_limit * 0.999
@@ -387,8 +394,12 @@ class QMTTrader:
             if code_num.startswith(("11", "12")):
                 # 可转债：涨跌幅限制 ±20%
                 estimated_limit = last_close * 0.80
-            elif code_num.startswith("688") or code_num.startswith("300"):
+            elif code_num.startswith(("300", "301", "688")):
+                # 创业板（300/301）、科创板（688）：±20%
                 estimated_limit = last_close * 0.80
+            elif self.is_st(stock_code):
+                # ST/*ST：±5%
+                estimated_limit = last_close * 0.95
             else:
                 estimated_limit = last_close * 0.90
             return last_price <= estimated_limit * 1.001
@@ -416,6 +427,32 @@ class QMTTrader:
         prefix = stock_code[:2]
         return prefix in ("11", "12")
 
+    def is_st(self, stock_code: str) -> bool:
+        """
+        判断是否为 ST/*ST 股（涨跌停限制 ±5%）。
+        通过 xtdata.get_instrument_detail 查询股票名，命中关键字 "ST" 即认为是 ST。
+        结果按 stock_code 缓存，避免重复查询。
+
+        Returns:
+            True  — ST/*ST 股
+            False — 非 ST，或查询失败/模拟模式
+        """
+        if self._mock:
+            return False
+        if stock_code in self._st_cache:
+            return self._st_cache[stock_code]
+        try:
+            detail = xtdata.get_instrument_detail(stock_code)
+            name = ""
+            if detail:
+                name = detail.get("InstrumentName") or detail.get("instrumentName") or ""
+            is_st_flag = "ST" in name
+            self._st_cache[stock_code] = is_st_flag
+            return is_st_flag
+        except Exception as e:
+            logger.debug(f"is_st 查询 {stock_code} 失败: {e}")
+            return False
+
     def _get_cb_offset(self, direction: str) -> float:
         """从 config 读取可转债价格偏移量（默认 0.002 = 0.2%）"""
         try:
@@ -442,21 +479,26 @@ class QMTTrader:
     # 计算下单量
     # ─────────────────────────────────────────────────────────
     @staticmethod
-    def calc_buy_volume(amount: float, price: float, min_lot: int = 100) -> int:
+    def calc_buy_volume(amount: float, price: float, min_lot: int = 100,
+                        fee_buffer: float = 0.001) -> int:
         """
-        根据金额和价格计算买入手数（向下取整到 min_lot 的整数倍）
+        根据金额和价格计算买入股数（向下取整到 min_lot 的整数倍）
 
         Args:
-            amount:  买入金额（元）
-            price:   当前价格（元/股）
-            min_lot: 最小交易单位（A股=100股=1手）
+            amount:     买入金额（元）
+            price:      当前价格（元/股）
+            min_lot:    最小交易单位（A股=100股=1手，可转债=10张=1手）
+            fee_buffer: 手续费/滑点预留比例，默认 0.1%。
+                        实际下单金额 = amount × (1 - fee_buffer)，
+                        避免佣金、印花税、滑点导致"资金不足"废单。
 
         Returns:
             买入股数（int）
         """
         if price <= 0:
             return 0
-        raw = amount / price
+        effective = amount * (1.0 - max(0.0, fee_buffer))
+        raw = effective / price
         volume = int(raw // min_lot) * min_lot
         return volume
 

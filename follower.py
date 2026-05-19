@@ -14,8 +14,10 @@ follower.py
 ────────────────────────────────────────────────────────────
 【ratio_follow 模式说明】
 
-  目标市值[i] = TOTAL_AMOUNT × (weight[i] / 100)
-  差值[i]     = 目标市值[i] - 当前市值[i]
+  跟单基准金额 = 账户实际总资产（trader.get_total_asset()，含市值+现金）
+                若查询失败，fallback 到 config.TOTAL_AMOUNT
+  目标市值[i]  = 跟单基准金额 × (weight[i] / 100)
+  差值[i]      = 目标市值[i] - 当前市值[i]
   差值 > 0  → 买入，差值 < 0  → 卖出
   |差值/目标市值| < REBALANCE_THRESHOLD  → 忽略（避免微小抖动）
 
@@ -92,9 +94,9 @@ class XueqiuFollower:
         logger.info(f"  目标组合:  {config.PORTFOLIO_ID}")
         logger.info(f"  跟单模式:  {mode}")
         if mode == "ratio_follow":
-            total = getattr(config, "TOTAL_AMOUNT", 100000.0)
-            thr   = getattr(config, "REBALANCE_THRESHOLD", 0.02)
-            logger.info(f"  总金额:    ¥{total:,.0f}")
+            fallback = getattr(config, "TOTAL_AMOUNT", 100000.0)
+            thr      = getattr(config, "REBALANCE_THRESHOLD", 0.02)
+            logger.info(f"  跟单基准:  动态读取账户总资产（fallback=¥{fallback:,.0f}）")
             logger.info(f"  再平衡阈值: {thr*100:.1f}%")
         else:
             logger.info(f"  固定金额:  ¥{config.FIXED_AMOUNT:,.0f} / 只")
@@ -407,7 +409,7 @@ class XueqiuFollower:
 
         # 获取 QMT 当前持仓
         qmt_positions = self.trader.get_positions()
-        total_amount = getattr(config, "TOTAL_AMOUNT", 100000.0)
+        total_amount = self.trader.get_total_asset() or getattr(config, "TOTAL_AMOUNT", 100000.0)
 
         cancel_ids = []
         for o in pending:
@@ -525,19 +527,24 @@ class XueqiuFollower:
     def _rebalance_by_ratio(self):
         """
         核心算法：
-          1. 读取 config.TOTAL_AMOUNT 作为跟单基准金额
+          1. 读取账户实际总资产（trader.get_total_asset()）作为跟单基准金额；
+             连接失败时 fallback 到 config.TOTAL_AMOUNT
           2. 拉取雪球最新完整持仓（含各股权重）
-          3. 计算每只股票 目标市值 = TOTAL_AMOUNT × weight%
+          3. 计算每只股票 目标市值 = 跟单基准金额 × weight%
              （weight 是雪球原始权重，各股之和 < 100% 时剩余即为现金比例）
           4. 差值 = 目标市值 - 当前市值
              差值 > +threshold → 买入
              差值 < -threshold → 卖出/减仓
           5. 先卖后买，买入前按可用现金按比例分配
         """
-        total_amount = getattr(config, "TOTAL_AMOUNT", 100000.0)
+        fallback     = getattr(config, "TOTAL_AMOUNT", 100000.0)
+        total_amount = self.trader.get_total_asset() or fallback
         threshold    = getattr(config, "REBALANCE_THRESHOLD", 0.02)
 
-        logger.info(f"  跟单基准金额：¥{total_amount:,.0f}（来自 config.TOTAL_AMOUNT）")
+        if total_amount == fallback:
+            logger.warning(f"  跟单基准金额：¥{total_amount:,.0f}（账户总资产查询失败，fallback 到 config.TOTAL_AMOUNT）")
+        else:
+            logger.info(f"  跟单基准金额：¥{total_amount:,.0f}（账户实际总资产 = 市值 + 现金）")
 
         # ── 1. 雪球目标持仓 ────────────────────────────────
         xq_positions = self.xq.get_current_positions()
@@ -736,11 +743,11 @@ class XueqiuFollower:
             logger.error(f"买入 {code}: 无法获取价格，跳过")
             return "skip"
         lot = self.trader.get_lot_size(code)
-        est_vol = int(amount / est_price // lot) * lot
+        est_vol = self.trader.calc_buy_volume(amount, est_price, min_lot=lot)
         if est_vol <= 0:
             logger.info(
                 f"【按比例买入】{code}  目标金额=¥{amount:,.0f}  "
-                f"预估{est_vol}{'张' if lot==10 else '股'}，不足{lot}手，跳过"
+                f"预估{est_vol}{'张' if lot==10 else '股'}，不足 1 手（{lot}{'张' if lot==10 else '股'}），跳过"
             )
             return "skip"
 
