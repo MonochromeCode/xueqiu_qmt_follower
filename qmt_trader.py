@@ -482,7 +482,7 @@ class QMTTrader:
     # ─────────────────────────────────────────────────────────
     @staticmethod
     def calc_buy_volume(amount: float, price: float, min_lot: int = 100,
-                        fee_buffer: float = 0.001) -> int:
+                        fee_buffer: float = 0.0005) -> int:
         """
         根据金额和价格计算买入股数（向下取整到 min_lot 的整数倍）
 
