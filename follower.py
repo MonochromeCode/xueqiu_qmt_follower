@@ -1378,10 +1378,17 @@ class XueqiuFollower:
             if direction == "BUY":
                 if self.trader.is_limit_up(code, tick=tick):
                     continue  # 仍涨停，继续等
-                logger.info(f"【卡单重试】{code} 涨停已解除，重新尝试买入 ¥{info['amount']:,.0f}")
+                # 重试时重新查询可用资金，避免使用涨停时计算的过期金额
+                avail_cash, _ = self.trader.get_asset()
+                retry_amount = min(info["amount"], avail_cash) if avail_cash > 0 else info["amount"]
+                if retry_amount <= 0:
+                    logger.warning(f"【卡单重试】{code} 可用资金不足，放弃重试")
+                    to_remove.append(code)
+                    continue
+                logger.info(f"【卡单重试】{code} 涨停已解除，重新尝试买入 ¥{retry_amount:,.0f}")
                 order_id = self.trader.buy(
                     stock_code=code,
-                    amount=info["amount"],
+                    amount=retry_amount,
                     price=None,
                     remark=f"雪球卡单重试-{config.PORTFOLIO_ID}",
                 )
@@ -1390,7 +1397,7 @@ class XueqiuFollower:
                     self._chase_orders[order_id] = {
                         "stock_code":    code,
                         "direction":     "BUY",
-                        "amount":        info["amount"],
+                        "amount":        retry_amount,
                         "volume":        0,
                         "ts":            time.time(),
                         "chase_count":   0,
@@ -1412,7 +1419,7 @@ class XueqiuFollower:
                 if order_id is not None and order_id > 0:
                     positions = self.trader.get_positions()
                     pos = positions.get(code)
-                    sell_vol = pos["can_use_volume"] if pos else (volume or 0)
+                    sell_vol = pos.get("can_use_volume", 0) if pos else (volume or 0)
                     tick_price = float((tick or {}).get("lastPrice") or 0)
                     self._chase_orders[order_id] = {
                         "stock_code":    code,
