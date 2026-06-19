@@ -27,6 +27,8 @@ import logging
 import requests
 from typing import Optional, Dict, List
 
+import config as _cfg
+
 logger = logging.getLogger(__name__)
 
 # ── 雪球 API 基础 URL ──────────────────────────────────────
@@ -62,7 +64,6 @@ def _alert_cookie_expired():
 def _send_dingtalk(text: str):
     """发送钉钉机器人告警（需在 config.py 配置 DINGTALK_WEBHOOK）"""
     try:
-        import config as _cfg
         webhook = getattr(_cfg, "DINGTALK_WEBHOOK", "")
         if not webhook:
             return
@@ -74,7 +75,6 @@ def _send_dingtalk(text: str):
 def _send_wecom(text: str):
     """发送企业微信机器人告警（需在 config.py 配置 WECOM_WEBHOOK）"""
     try:
-        import config as _cfg
         webhook = getattr(_cfg, "WECOM_WEBHOOK", "")
         if not webhook:
             return
@@ -107,8 +107,6 @@ class XueqiuClient:
         })
         # 首次访问主页以初始化 session（获取 token 等 cookie）
         self._init_session()
-        # 记录上次轮询到的最新消息 id，避免重复触发
-        self._last_notification_id: Optional[int] = None
 
     # ─────────────────────────────────────────────────────────
     # 内部辅助
@@ -173,13 +171,7 @@ class XueqiuClient:
 
         positions = []
         try:
-            if source == "current":
-                # 新版接口格式
-                last_rb = data.get("data", {}).get("last_rb") or data.get("last_rb") or {}
-            else:
-                # v5接口格式
-                last_rb = data.get("data", {}).get("last_rb") or data.get("last_rb") or {}
-
+            last_rb = data.get("data", {}).get("last_rb") or data.get("last_rb") or {}
             holdings = last_rb.get("holdings", [])
             for item in holdings:
                 weight = float(item.get("weight") or 0)
@@ -320,43 +312,32 @@ class XueqiuClient:
             logger.error(f"解析调仓记录失败: {e}")
             return None
 
-    def poll_notification(self) -> bool:
+    def poll_notification(self, last_known_id: int) -> Optional[dict]:
         """
         轮询雪球消息通知，检测是否有新的"组合调仓"推送。
 
-        原理：定期检查最新调仓记录的 ID，如发现新 ID 则认为有新调仓。
+        Args:
+            last_known_id: 已处理的最新调仓 ID（由 follower 的持久化状态提供）
 
         Returns:
-            True  — 检测到新的组合调仓通知
-            False — 无新通知
+            dict — 检测到新调仓，直接返回 rebalancing 数据（避免调用方再拉一次）
+            None — 无新通知或获取失败
         """
-        # 直接检查最新调仓记录的 ID
         latest = self.get_latest_rebalancing()
         if latest is None:
-            return False
+            return None
 
         try:
             latest_id = latest.get("id")
-            if latest_id is None:
-                return False
+            if latest_id is None or latest_id == last_known_id:
+                return None
 
-            # 首次运行，仅记录 id，不触发
-            if self._last_notification_id is None:
-                self._last_notification_id = latest_id
-                logger.debug(f"初始化调仓 ID: {latest_id}")
-                return False
-
-            if latest_id == self._last_notification_id:
-                return False  # 没有新调仓
-
-            # 发现新调仓
             logger.info(f"检测到 [{self.portfolio_id}] 新调仓！ID={latest_id}")
-            self._last_notification_id = latest_id
-            return True
+            return latest
 
         except Exception as e:
             logger.error(f"解析调仓通知失败: {e}")
-            return False
+            return None
 
 
 
@@ -394,16 +375,20 @@ def _to_qmt_code(raw_code: str) -> str:
 
     # 纯6位数字 → 按首位判断市场
     if code.isdigit() and len(code) == 6:
-        if code.startswith("6"):
+        if code.startswith(("6", "5")):
+            # 6xxxxx: 沪市股票；5xxxxx: 沪市 ETF/LOF/REIT
             return f"{code}.SH"
         elif code.startswith(("0", "3")):
+            # 0xxxxx: 深市主板；3xxxxx: 创业板
             return f"{code}.SZ"
         elif code.startswith(("8", "4")):
+            # 8xxxxx/4xxxxx: 北交所
             return f"{code}.BJ"
-        # 可转债：沪市 11xxxx → .SH，深市 12xxxx → .SZ
         elif code.startswith("11"):
+            # 11xxxx: 沪市可转债
             return f"{code}.SH"
-        elif code.startswith("12"):
+        elif code.startswith("1"):
+            # 12xxxx: 深市可转债；15xxxx/16xxxx/18xxxx: 深市 ETF/LOF/REIT
             return f"{code}.SZ"
 
     # 港股：纯5位数字

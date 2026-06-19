@@ -5,20 +5,20 @@
 # ────────────────────────────────────────────
 # 1. QMT 交易端配置
 # ────────────────────────────────────────────
-QMT_PATH = r"C:\东北证券NET专业版(测试版)\userdata_mini"   # ← 改为你的 QMT 安装路径
-ACCOUNT_ID = "xxxx"                           # ← 改为你的资金账号
+QMT_PATH = r"D:\testnet\userdata_mini"   # ← 改为你的 QMT 安装路径
+ACCOUNT_ID = "xxx"                           # ← 改为你的资金账号
 ACCOUNT_TYPE = "STOCK"                              # 普通股票账户
 
 # ────────────────────────────────────────────
 # 2. 雪球组合配置
 # ────────────────────────────────────────────
 # 要跟踪的雪球组合代码（如 ZH123456）
-PORTFOLIO_ID = "ZH3375064"                           # ← 改为目标组合 ID
-# PORTFOLIO_ID = "ZH3605259"                           # ← 改为目标组合 ID
+# PORTFOLIO_ID = "ZH3375064"                           # ← 改为目标组合 ID
+PORTFOLIO_ID = "ZH3605259"                           # ← 改为目标组合 ID
 
 # 雪球 Cookie（登录后从浏览器 DevTools → Network → 任意请求 → Request Headers 获取）
 # 必须填写，否则无法访问组合数据
-XUEQIU_COOKIE = "xq_a_token=xxxx"       # ← 改为你的雪球 Cookie
+XUEQIU_COOKIE = "xq_a_token=f695007a0c1926xxx1721a8d0adb2ee15e1cxxx"       # ← 改为你的雪球 Cookie
 
 # ────────────────────────────────────────────
 # 3. 交易策略配置
@@ -36,7 +36,7 @@ TRADE_MODE = "ratio_follow"
 #
 # TOTAL_AMOUNT 仅作为 fallback：当 QMT 未连接或 query_stock_asset 返回 0 时使用。
 # 正常运行下 TOTAL_AMOUNT 不参与计算。
-TOTAL_AMOUNT = 88888888.0
+TOTAL_AMOUNT = 100000.0
 # 再平衡触发阈值：某只股票实际市值偏离目标市值超过此比例才调整
 # 0.02 = 偏差 2% 以上才下单（避免因行情微波动频繁下单）
 REBALANCE_THRESHOLD = 0.02
@@ -95,6 +95,20 @@ LOG_LEVEL = "INFO"   # DEBUG / INFO / WARNING / ERROR
 # 非交易时间检测雪球撤单的轮询间隔（秒）
 OFFHOUR_CANCEL_INTERVAL = 300
 
+# 开盘冷静期（秒）：开盘后等待此时间再执行待开盘再平衡，避免开盘瞬间波动
+OPEN_COOLDOWN_SECONDS = 30
+
+# 卖单回款等待超时（秒）：先卖后买时，等待卖单成交回款后再执行买入
+# 避免限价卖单未成交时现金被高估，导致买入废单；设为 0 则不等待
+SELL_SETTLE_TIMEOUT = 8.0
+
+# 最大追单次数：同一笔订单追单超过此次数后放弃
+MAX_CHASE_COUNT = 5
+
+# 最大追单价格偏离：当前价相对初始信号价的偏离超过此比例时放弃追单
+# 0.03 表示追到比信号价贵/便宜 3% 就停止，避免追着价格一路跑
+MAX_CHASE_PRICE_DEVIATION = 0.03
+
 # ── 可转债价格偏移 ──────────────────────────────────────────────
 # 可转债流动性差时，卖一/买一价可能偏高或偏低，
 # 偏移量 = 基础对手价 × (1 + offset)，确保下单能快速成交
@@ -109,6 +123,6 @@ STATE_FILE = "./state.json"
 
 # ── 可选：告警 Webhook（填写后 Cookie 失效等异常会自动推送）──
 # 钉钉机器人 Webhook（留空则不推送）
-DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=d197cbdb74823177f99a6a8d3e84464dadd52345e3ff84dcb9fb978xxxx"
+DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=xx"
 # 企业微信机器人 Webhook（留空则不推送）
 WECOM_WEBHOOK = ""

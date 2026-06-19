@@ -14,6 +14,7 @@ miniQMT 交易执行模块
 import time
 import math
 import logging
+import datetime
 from typing import Optional, Dict, List
 
 import config
@@ -114,8 +115,8 @@ class QMTTrader:
         self._reconnect_interval = 30   # 断线后每 30 秒尝试重连一次
         self._last_reconnect_ts  = 0.0
 
-        # ST 股票名称缓存（避免重复调用 xtdata.get_instrument_detail）
-        self._st_cache: Dict[str, bool] = {}
+        # ST 股票名称缓存 {stock_code: (is_st, date_str)}，跨日自动失效
+        self._st_cache: Dict[str, tuple] = {}
 
     # ─────────────────────────────────────────────────────────
     # 连接 & 断开
@@ -184,27 +185,31 @@ class QMTTrader:
     # ─────────────────────────────────────────────────────────
     # 查询接口
     # ─────────────────────────────────────────────────────────
-    def get_cash(self) -> float:
-        """查询账户可用资金（元）"""
+    def get_asset(self) -> tuple:
+        """
+        一次调用同时返回 (cash, total_asset)，避免两次 query_stock_asset。
+
+        Returns:
+            (cash: float, total_asset: float)
+        """
         if self._mock:
-            return 100000.0
+            return (100000.0, 200000.0)
         try:
             asset = self._trader.query_stock_asset(self._account)
-            return float(asset.cash) if asset else 0.0
+            if asset:
+                return (float(asset.cash), float(asset.total_asset))
+            return (0.0, 0.0)
         except Exception as e:
-            logger.error(f"查询可用资金失败: {e}")
-            return 0.0
+            logger.error(f"查询账户资产失败: {e}")
+            return (0.0, 0.0)
+
+    def get_cash(self) -> float:
+        """查询账户可用资金（元）"""
+        return self.get_asset()[0]
 
     def get_total_asset(self) -> float:
         """查询账户总资产（元）"""
-        if self._mock:
-            return 200000.0
-        try:
-            asset = self._trader.query_stock_asset(self._account)
-            return float(asset.total_asset) if asset else 0.0
-        except Exception as e:
-            logger.error(f"查询总资产失败: {e}")
-            return 0.0
+        return self.get_asset()[1]
 
     def get_positions(self) -> Dict[str, Dict]:
         """
@@ -259,6 +264,22 @@ class QMTTrader:
         except Exception as e:
             logger.error(f"获取行情 {stock_code} 失败: {e}")
         return None
+
+    def get_full_ticks(self, stock_codes: List[str]) -> Dict[str, dict]:
+        """批量获取多只股票完整 tick 数据，一次调用替代多次单股查询"""
+        if self._mock:
+            mock_tick = {
+                "lastPrice": 10.0, "lastClose": 9.5,
+                "upperLimit": 10.45, "lowerLimit": 8.55,
+                "askPrice": [10.02, 10.03, 10.04, 10.05, 10.06],
+                "bidPrice": [9.98, 9.97, 9.96, 9.95, 9.94],
+            }
+            return {c: mock_tick for c in stock_codes}
+        try:
+            return xtdata.get_full_tick(stock_codes) or {}
+        except Exception as e:
+            logger.error(f"批量获取行情失败: {e}")
+            return {}
 
     def get_tick(self, stock_code: str) -> Optional[Dict]:
         """
@@ -323,7 +344,7 @@ class QMTTrader:
         # fallback 到最新价
         return float(tick.get("lastPrice") or 0) or None
 
-    def is_limit_up(self, stock_code: str) -> bool:
+    def is_limit_up(self, stock_code: str, tick: Optional[Dict] = None) -> bool:
         """
         判断股票是否已涨停（最新价 >= 涨停价）
 
@@ -337,7 +358,8 @@ class QMTTrader:
             True  — 已涨停，不宜追买
             False — 未涨停
         """
-        tick = self.get_tick(stock_code)
+        if tick is None:
+            tick = self.get_tick(stock_code)
         if tick is None:
             return False
 
@@ -369,7 +391,7 @@ class QMTTrader:
 
         return False
 
-    def is_limit_down(self, stock_code: str) -> bool:
+    def is_limit_down(self, stock_code: str, tick: Optional[Dict] = None) -> bool:
         """
         判断股票是否已跌停（最新价 <= 跌停价）
 
@@ -377,7 +399,8 @@ class QMTTrader:
             True  — 已跌停，不宜下卖单
             False — 未跌停
         """
-        tick = self.get_tick(stock_code)
+        if tick is None:
+            tick = self.get_tick(stock_code)
         if tick is None:
             return False
 
@@ -433,7 +456,7 @@ class QMTTrader:
         """
         判断是否为 ST/*ST 股（涨跌停限制 ±5%）。
         通过 xtdata.get_instrument_detail 查询股票名，命中关键字 "ST" 即认为是 ST。
-        结果按 stock_code 缓存，避免重复查询。
+        结果按 stock_code 缓存，当日有效，跨日自动重新查询（应对摘帽/新增 ST）。
 
         Returns:
             True  — ST/*ST 股
@@ -441,15 +464,17 @@ class QMTTrader:
         """
         if self._mock:
             return False
-        if stock_code in self._st_cache:
-            return self._st_cache[stock_code]
+        today = datetime.date.today().isoformat()
+        cached = self._st_cache.get(stock_code)
+        if cached is not None and cached[1] == today:
+            return cached[0]
         try:
             detail = xtdata.get_instrument_detail(stock_code)
             name = ""
             if detail:
                 name = detail.get("InstrumentName") or detail.get("instrumentName") or ""
             is_st_flag = "ST" in name
-            self._st_cache[stock_code] = is_st_flag
+            self._st_cache[stock_code] = (is_st_flag, today)
             return is_st_flag
         except Exception as e:
             logger.debug(f"is_st 查询 {stock_code} 失败: {e}")

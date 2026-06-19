@@ -39,6 +39,7 @@ import json
 import logging
 import datetime
 import pathlib
+import requests
 from typing import Dict, List, Optional, Tuple
 
 from xueqiu_client import XueqiuClient
@@ -73,6 +74,13 @@ def _seconds_to_open() -> float:
     if now >= target:
         target += datetime.timedelta(days=1)
     return (target - now).total_seconds()
+
+
+def _seconds_since_open() -> float:
+    """距今天 09:30 开盘已经过去多少秒（非交易时间返回 0）"""
+    now = datetime.datetime.now()
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    return max(0.0, (now - open_time).total_seconds())
 
 
 # ─────────────────────────────────────────────────────────────
@@ -136,6 +144,20 @@ class XueqiuFollower:
         # } }
         self._chase_orders: Dict[int, dict] = {}
         self._last_chase_ts: float = 0.0
+
+        # 涨跌停卡单追踪：因涨停/跌停跳过的订单，解除后自动重试
+        # 格式：{ stock_code: {
+        #     "direction": "BUY" | "SELL",
+        #     "amount":    float,   # 买入金额
+        #     "volume":    int,     # 卖出股数（0=全部可卖）
+        #     "ts":        float,   # 记录时间戳
+        # } }
+        self._stuck_orders: Dict[str, dict] = {}
+        self._last_stuck_check_ts: float = 0.0
+
+        # 兜底定时检查计时器
+        self._force_check_interval: int = 300
+        self._last_force_check_ts: float = 0.0
 
         # 状态持久化文件（保存 last_rebalancing_id，重启后不丢失）
         self._state_file = pathlib.Path(
@@ -239,8 +261,13 @@ class XueqiuFollower:
                     time.sleep(30)
                     continue
 
-            has_new_notification = self.xq.poll_notification()
-            should_force_check   = self._should_force_check()
+            # 每次循环只拉一次雪球接口，同时用于新通知检测和兜底核查
+            latest = self.xq.get_latest_rebalancing()
+            latest_id = latest.get("id") if latest else None
+            has_new_notification = (
+                latest if (latest_id and latest_id != self._last_rebalancing_id) else None
+            )
+            should_force_check = self._should_force_check()
 
             # 「待开盘重算」：非交易时间撤单后，开盘第一次循环强制执行再平衡
             if self._pending_rebalance:
@@ -251,24 +278,23 @@ class XueqiuFollower:
                 self._rebalance_pending()
                 # _rebalance_pending 内部会清除标记并保存状态
 
-            elif has_new_notification or should_force_check:
-                if has_new_notification:
+            elif has_new_notification is not None or should_force_check:
+                if has_new_notification is not None:
                     logger.info("收到调仓通知，获取最新持仓...")
                 else:
                     logger.debug("定时核查调仓...")
-                self._handle_rebalancing()
+                self._handle_rebalancing(latest)
 
-            # 交易时间内：每 30 秒检查一次未成交挂单，撤单后按最新价重下
+            # 交易时间内：每 10 秒检查一次未成交挂单，撤单后按最新价重下
             self._chase_unfinished_orders()
+            # 每 30 秒检查一次涨跌停卡单，解除后自动重试
+            self._retry_stuck_orders()
 
             time.sleep(config.POLL_INTERVAL_SECONDS)
 
     # ─────────────────────────────────────────────────────────
     # 兜底定时检查（每 5 分钟主动拉一次）
     # ─────────────────────────────────────────────────────────
-    _force_check_interval = 300
-    _last_force_check_ts  = 0.0
-
     def _should_force_check(self) -> bool:
         now_ts = time.time()
         if now_ts - self._last_force_check_ts >= self._force_check_interval:
@@ -396,27 +422,41 @@ class XueqiuFollower:
         if not pending:
             return
 
-        # 获取最新雪球持仓目标
-        xq_positions = self.xq.get_current_positions()
-        if not xq_positions:
-            return
+        # 使用缓存的雪球持仓目标（由最近一次 _rebalance_by_ratio 保存）
+        # 若缓存为空（例如重启后尚未执行过再平衡），则拉取雪球接口作为降级
+        # 权重直接用原始值 /100（与 _rebalance_by_ratio 一致，保留现金比例）
+        if self._last_target_weights:
+            target_weights = {c: w / 100.0 for c, w in self._last_target_weights.items()}
+        else:
+            xq_positions = self.xq.get_current_positions()
+            if not xq_positions:
+                return
+            target_weights: Dict[str, float] = {
+                p["stock_code"]: p["weight"] / 100.0 for p in xq_positions
+            }
 
-        total_weight = sum(p["weight"] for p in xq_positions)
-        target_weights: Dict[str, float] = {}
-        if total_weight > 0:
-            for p in xq_positions:
-                target_weights[p["stock_code"]] = p["weight"] / total_weight
-
-        # 获取 QMT 当前持仓
+        # 获取 QMT 当前持仓，并用实时价 × 持仓量计算当前市值（与 _rebalance_by_ratio 一致）
         qmt_positions = self.trader.get_positions()
-        total_amount = self.trader.get_total_asset() or getattr(config, "TOTAL_AMOUNT", 100000.0)
+        cash, total_amount = self.trader.get_asset()
+        total_amount = total_amount or getattr(config, "TOTAL_AMOUNT", 100000.0)
+
+        pos_codes = [c for c, p in qmt_positions.items() if int(p.get("volume") or 0) > 0]
+        ticks = self.trader.get_full_ticks(pos_codes) if pos_codes else {}
 
         cancel_ids = []
         for o in pending:
             code = o["stock_code"]
             target_w = target_weights.get(code, 0.0)
             target_value = total_amount * target_w
-            cur_value = float((qmt_positions.get(code) or {}).get("market_value") or 0)
+
+            pos = qmt_positions.get(code)
+            if pos:
+                volume = int(pos.get("volume") or 0)
+                tick = ticks.get(code, {})
+                real_price = float(tick.get("lastPrice") or tick.get("last_price") or 0)
+                cur_value = real_price * volume if real_price > 0 else float(pos.get("market_value") or 0)
+            else:
+                cur_value = 0.0
 
             if o["order_type"] == "BUY":
                 # 买单：若目标已不需要买（目标<=当前），则撤
@@ -453,6 +493,17 @@ class XueqiuFollower:
 
         注意：此方法只在交易时间内调用，不会在非交易时间触发。
         """
+        # 开盘冷静期：等待开盘波动平息后再执行
+        cooldown = getattr(config, "OPEN_COOLDOWN_SECONDS", 30)
+        if cooldown > 0:
+            elapsed = _seconds_since_open()
+            if elapsed < cooldown:
+                wait = cooldown - elapsed
+                logger.info(
+                    f"【待开盘重算】开盘冷静期，还需等待 {wait:.0f}s（OPEN_COOLDOWN_SECONDS={cooldown}）"
+                )
+                time.sleep(wait)
+
         # 再拉一次最新 ID，防止开盘前雪球又有变化
         latest = self.xq.get_latest_rebalancing()
         if latest:
@@ -486,12 +537,17 @@ class XueqiuFollower:
     # ─────────────────────────────────────────────────────────
     # 处理调仓（入口）
     # ─────────────────────────────────────────────────────────
-    def _handle_rebalancing(self):
-        """拉取最新调仓 ID，如有更新则执行再平衡"""
-        rebalancing = self.xq.get_latest_rebalancing()
+    def _handle_rebalancing(self, rebalancing: Optional[dict] = None):
+        """拉取最新调仓 ID，如有更新则执行再平衡。
+
+        Args:
+            rebalancing: poll_notification 返回的 rebalancing 数据，None 时自行拉取
+        """
         if rebalancing is None:
-            logger.warning("获取调仓数据失败，稍后重试")
-            return
+            rebalancing = self.xq.get_latest_rebalancing()
+            if rebalancing is None:
+                logger.warning("获取调仓数据失败，稍后重试")
+                return
 
         rid = rebalancing.get("id")
         if rid and rid == self._last_rebalancing_id:
@@ -502,6 +558,10 @@ class XueqiuFollower:
         self._last_rebalancing_id = rid
         # 若同时有 pending_rebalance 标记，一并清除（避免重复执行）
         self._pending_rebalance = False
+        # 新调仓信号来了，清除旧的涨跌停卡单（避免用旧量重试）
+        if self._stuck_orders:
+            logger.info(f"清除 {len(self._stuck_orders)} 笔涨跌停卡单（新调仓信号覆盖）")
+            self._stuck_orders.clear()
         self._save_state()   # 持久化，重启后不重复执行
 
         # ── 先撤销 QMT 所有未成交委托（防止旧挂单干扰再平衡计算）──
@@ -538,7 +598,8 @@ class XueqiuFollower:
           5. 先卖后买，买入前按可用现金按比例分配
         """
         fallback     = getattr(config, "TOTAL_AMOUNT", 100000.0)
-        total_amount = self.trader.get_total_asset() or fallback
+        _, total_amount = self.trader.get_asset()
+        total_amount = total_amount or fallback
         threshold    = getattr(config, "REBALANCE_THRESHOLD", 0.02)
 
         if total_amount == fallback:
@@ -563,6 +624,9 @@ class XueqiuFollower:
         xq_cash_ratio = 100.0 - total_stock_weight
         target_cash = total_amount * (xq_cash_ratio / 100.0)
 
+        # 缓存目标权重，供非交易时间撤单检测使用（避免再次拉取雪球接口）
+        self._last_target_weights = {p["stock_code"]: p["weight"] for p in xq_positions}
+
         # 目标市值字典 {stock_code: target_value}
         # 直接用雪球原始权重（0~100），除以100转为比例
         target: Dict[str, float] = {}
@@ -573,14 +637,21 @@ class XueqiuFollower:
         # ── 2. QMT 当前持仓市值（实时价 × 持仓量）──────────
         # 注意：不使用 pos.market_value（QMT 该字段可能是昨收价快照，盘中不实时）
         # 改为：实时行情价 × 持仓量，确保差值计算基于当前市场价格
+        # 使用批量行情查询，一次 xtdata.get_full_tick 替代 N 次单股查询
         qmt_positions = self.trader.get_positions()
+        all_pos_codes = [c for c, p in qmt_positions.items() if int(p.get("volume") or 0) > 0]
+        # 合并持仓代码和目标买入代码，一次批量拉取，避免后续每只股票单独查询
+        all_tick_codes = list(set(all_pos_codes) | set(target.keys()))
+        ticks = self.trader.get_full_ticks(all_tick_codes) if all_tick_codes else {}
+
         current_value: Dict[str, float] = {}
         for code, pos in qmt_positions.items():
             volume = int(pos.get("volume") or 0)
             if volume <= 0:
                 continue
-            real_price = self.trader.get_latest_price(code)
-            if real_price and real_price > 0:
+            tick = ticks.get(code, {})
+            real_price = float(tick.get("lastPrice") or tick.get("last_price") or 0)
+            if real_price > 0:
                 current_value[code] = real_price * volume
             else:
                 # 行情获取失败时，降级用 market_value（避免全部被当成 0 处理）
@@ -592,8 +663,9 @@ class XueqiuFollower:
         # ── 3. 计算差值 ────────────────────────────────────
         all_codes = set(target.keys()) | set(current_value.keys())
 
-        buy_orders:  List[Tuple[str, float]] = []   # (code, 买入金额)
-        sell_orders: List[Tuple[str, float]] = []   # (code, 卖出金额)
+        buy_orders:         List[Tuple[str, float]] = []   # (code, 买入金额)
+        reduce_orders:      List[Tuple[str, float]] = []   # (code, 减仓金额)
+        liquidation_orders: List[Tuple[str, float]] = []   # (code, 清仓金额)
 
         logger.info("=" * 55)
         logger.info(
@@ -628,36 +700,78 @@ class XueqiuFollower:
                 buy_orders.append((code, diff))
             elif diff < 0:
                 action = f"卖出 ¥{abs(diff):,.0f}"
-                sell_orders.append((code, abs(diff)))
+                reduce_orders.append((code, abs(diff)))
             else:
                 action = "无需调整"
 
             logger.info(f"  {code:<12} {tgt:>10,.0f} {cur:>10,.0f} {diff:>+10,.0f}  {action}")
 
-        # 不在雪球持仓内、但本地有持仓的股票 → 全部清仓
+        # 不在雪球持仓内、但本地有持仓的股票 → 全部清仓（优先于减仓执行）
         for code in set(current_value.keys()) - set(target.keys()):
             cur = current_value[code]
             if cur > 0:
                 logger.info(f"  {code:<12} {'0':>10} {cur:>10,.0f} {-cur:>+10,.0f}  清仓（已从组合移除）")
-                sell_orders.append((code, cur))
+                liquidation_orders.append((code, cur))
 
         logger.info("=" * 55)
+
+        # 清仓优先于减仓：先卖完清仓单，再处理减仓单，释放更多资金给买入
+        sell_orders = liquidation_orders + reduce_orders
+        # 买入按差值从大到小排序：资金不足时优先填满最大缺口
+        buy_orders.sort(key=lambda x: -x[1])
 
         # ── 4. 先卖后买 ────────────────────────────────────
         results: List[Tuple[str, str, str]] = []   # (code, direction, status)
 
         for code, sell_amount in sell_orders:
-            status = self._execute_sell_by_value(code, sell_amount)
+            status = self._execute_sell_by_value(
+                code, sell_amount,
+                positions=qmt_positions,
+                tick=ticks.get(code),
+                target_value=target.get(code, 0.0),
+            )
             results.append((code, "卖出", status))
 
-        # 卖出完成后，重新读取可用现金，按比例分配给各买入单
-        # 避免可用现金不足时多笔买单全部失败
+        # 卖出完成后，等待卖单成交回款再读现金，避免限价卖单挂单期间现金被高估
+        if sell_orders and buy_orders:
+            self._wait_sells_settled(
+                sell_codes=[code for code, _ in sell_orders],
+                timeout=getattr(config, "SELL_SETTLE_TIMEOUT", 8.0),
+            )
+
+        # 重新读取可用现金和最新持仓，按比例分配给各买入单
+        # 卖出后持仓已变，用最新快照计算买入量，避免基于旧快照偏差
         if buy_orders:
-            available_cash = self.trader.get_cash()
+            available_cash, total_amount_now = self.trader.get_asset()
+            total_amount_now = total_amount_now or total_amount
+            # 刷新持仓快照（卖出后持仓已变化）
+            fresh_positions = self.trader.get_positions()
+            buy_codes = [code for code, _ in buy_orders]
+            fresh_ticks = self.trader.get_full_ticks(buy_codes) if buy_codes else {}
+            fresh_current_value: Dict[str, float] = {}
+            for code in buy_codes:
+                pos = fresh_positions.get(code)
+                if pos and int(pos.get("volume") or 0) > 0:
+                    tick = fresh_ticks.get(code, {})
+                    price = float(tick.get("lastPrice") or 0)
+                    vol = int(pos.get("volume") or 0)
+                    fresh_current_value[code] = price * vol if price > 0 else float(pos.get("market_value") or 0)
+
+            # 用最新持仓重新计算每只股票实际买入差值
+            refreshed_buy_orders = []
+            for code, buy_amount in buy_orders:
+                tgt = target.get(code, 0.0)
+                cur = fresh_current_value.get(code, 0.0)
+                diff = tgt - cur
+                if diff <= 0:
+                    logger.info(f"  {code} 持仓刷新后差值≤0（可能卖单已成交），跳过买入")
+                    continue
+                refreshed_buy_orders.append((code, diff))
+
             # 预留 MIN_CASH_RATIO 的保留金，不全部投入买入
-            reserved_cash = total_amount * getattr(config, "MIN_CASH_RATIO", 0.05)
+            reserved_cash = total_amount_now * getattr(config, "MIN_CASH_RATIO", 0.05)
             spendable_cash = max(0, available_cash - reserved_cash)
-            total_buy_needed = sum(amt for _, amt in buy_orders)
+            total_buy_needed = sum(amt for _, amt in refreshed_buy_orders)
 
             if total_buy_needed > 0 and spendable_cash < total_buy_needed:
                 logger.warning(
@@ -665,16 +779,20 @@ class XueqiuFollower:
                     f"可买入=¥{spendable_cash:,.0f}  买入需求=¥{total_buy_needed:,.0f}  "
                     f"现金不足，按比例缩减各买单"
                 )
-                # 按各买单占总需求的比例分配可买入现金
                 adjusted_buy_orders = [
                     (code, spendable_cash * (amt / total_buy_needed))
-                    for code, amt in buy_orders
+                    for code, amt in refreshed_buy_orders
                 ]
             else:
-                adjusted_buy_orders = buy_orders
+                adjusted_buy_orders = refreshed_buy_orders
 
             for code, buy_amount in adjusted_buy_orders:
-                status = self._execute_buy_by_value(code, buy_amount)
+                status = self._execute_buy_by_value(
+                    code, buy_amount,
+                    cash=available_cash,
+                    total_asset=total_amount_now,
+                    tick=fresh_ticks.get(code),
+                )
                 results.append((code, "买入", status))
 
         # ── 5. 执行结果汇总 ─────────────────────────────────
@@ -696,17 +814,23 @@ class XueqiuFollower:
             logger.info("  无需执行买卖操作")
 
         # ── 6. 现金对比提示 ───────────────────────────────────
-        actual_cash = self.trader.get_cash()
+        actual_cash, _ = self.trader.get_asset()
         cash_diff = actual_cash - target_cash
         logger.info(
             f"  现金状态：当前可用=¥{actual_cash:,.0f}  "
             f"目标=¥{target_cash:,.0f}  偏差=¥{cash_diff:+,.0f}"
         )
 
+        # ── 7. 钉钉通知 ──────────────────────────────────────
+        self._notify_rebalance_done(results, total_amount, actual_cash, target_cash)
+
     # ─────────────────────────────────────────────────────────
     # ratio_follow：按目标金额买入
     # ─────────────────────────────────────────────────────────
-    def _execute_buy_by_value(self, code: str, amount: float) -> str:
+    def _execute_buy_by_value(self, code: str, amount: float,
+                              cash: Optional[float] = None,
+                              total_asset: Optional[float] = None,
+                              tick: Optional[Dict] = None) -> str:
         """
         买入指定金额的股票（下单前先撤该股旧挂单）
 
@@ -715,7 +839,7 @@ class XueqiuFollower:
             "skip"    — 被风控/涨停/无价格等跳过
             "fail"    — 下单失败（QMT 返回失败）
         """
-        if not self._risk_check_buy(code, amount):
+        if not self._risk_check_buy(code, amount, cash=cash, total_asset=total_asset):
             return "skip"
 
         # 先撤该股票的旧挂单，避免重复或冲突
@@ -731,19 +855,44 @@ class XueqiuFollower:
                     f"但继续执行（旧挂单由 QMT 兜底：可用量校验）"
                 )
 
-        # ── 价格获取：买入使用卖一价（对手价），在 trader.buy() 内部处理 ──
-        # 涨停保护：涨停时不追买
-        if config.LIMIT_PROTECTION and self.trader.is_limit_up(code):
-            logger.warning(f"【风控-涨停】{code} 当前已涨停，跳过买入（等下个交易日）")
+        # 一次 tick 查询：用 lastPrice 估算手数，askPrice[0] 作委托价
+        # 优先使用调用方传入的 tick（已批量拉取），避免重复单股查询
+        if tick is None:
+            tick = self.trader.get_tick(code)
+        if tick is None:
+            logger.error(f"买入 {code}: 无法获取行情，跳过")
             return "skip"
 
-        # ── 预估买入张数：不足一手则跳过（避免可转债等品种下单失败）──
-        est_price = self.trader.get_latest_price(code)
-        if est_price is None or est_price <= 0:
-            logger.error(f"买入 {code}: 无法获取价格，跳过")
+        # 涨停保护（tick 已在手，直接复用）
+        if config.LIMIT_PROTECTION and self.trader.is_limit_up(code, tick=tick):
+            logger.warning(f"【风控-涨停】{code} 当前已涨停，跳过买入（等下个交易日）")
+            self._stuck_orders[code] = {
+                "direction": "BUY",
+                "amount":    amount,
+                "volume":    0,
+                "ts":        time.time(),
+            }
             return "skip"
+
+        est_price = float(tick.get("lastPrice") or 0)
+        if est_price <= 0:
+            logger.error(f"买入 {code}: lastPrice 为 0，跳过")
+            return "skip"
+
+        ask_list = tick.get("askPrice")
+        ask_price = float(ask_list[0]) if ask_list else est_price
+        if ask_price <= 0:
+            ask_price = est_price
+
+        # 可转债：在卖一价基础上加偏移，确保流动性差时也能成交
+        if self.trader.is_cb(code):
+            offset = self.trader._get_cb_offset("BUY")
+            ask_price = round(ask_price * (1 + offset), 2)
+
+        ask_price = self.trader.align_price(ask_price, code)
+
         lot = self.trader.get_lot_size(code)
-        est_vol = self.trader.calc_buy_volume(amount, est_price, min_lot=lot)
+        est_vol = self.trader.calc_buy_volume(amount, ask_price, min_lot=lot)
         if est_vol <= 0:
             logger.info(
                 f"【按比例买入】{code}  目标金额=¥{amount:,.0f}  "
@@ -752,20 +901,21 @@ class XueqiuFollower:
             return "skip"
 
         logger.info(f"【按比例买入】{code}  目标金额=¥{amount:,.0f}")
-        # price=None → trader.buy() 内部自动获取卖一价（对手价），确保快速成交
         order_id = self.trader.buy(
             stock_code=code,
             amount=amount,
-            price=None,
+            price=ask_price,
             remark=f"雪球比例跟单-{config.PORTFOLIO_ID}",
         )
         if order_id is not None and order_id > 0:
             self._chase_orders[order_id] = {
-                "stock_code": code,
-                "direction":  "BUY",
-                "amount":     amount,
-                "volume":     0,
-                "ts":         time.time(),
+                "stock_code":    code,
+                "direction":     "BUY",
+                "amount":        amount,
+                "volume":        0,
+                "ts":            time.time(),
+                "chase_count":   0,
+                "initial_price": ask_price,
             }
             return "ok"
         return "fail"
@@ -773,11 +923,17 @@ class XueqiuFollower:
     # ─────────────────────────────────────────────────────────
     # ratio_follow：按目标金额卖出
     # ─────────────────────────────────────────────────────────
-    def _execute_sell_by_value(self, code: str, sell_amount: float) -> str:
+    def _execute_sell_by_value(self, code: str, sell_amount: float,
+                               positions: Optional[Dict] = None,
+                               tick: Optional[Dict] = None,
+                               target_value: float = 0.0) -> str:
         """
         卖出指定市值的股票（下单前先撤该股旧挂单）
 
-        sell_amount: 需要减少的市值（元）
+        sell_amount:  需要减少的市值（元）
+        target_value: 目标持仓市值（元），>0 时用目标股数差值法计算卖出量，
+                      消除 int(sell_amount/price//lot)*lot 的双重 floor 误差；
+                      0 表示清仓，直接卖出全部可用持仓。
 
         Returns:
             "ok"      — 下单成功
@@ -785,11 +941,12 @@ class XueqiuFollower:
             "fail"    — 下单失败
 
         规则：
-          1. 按比例计算卖出股数，向下取整到 100 股的整数倍
-          2. 若计算结果 >= can_use，则全部卖出（清仓）
-          3. 若计算结果 < 100（不足一手），也全部卖出——
-             持仓量太小，强制清仓以完全跟紧组合，避免残留碎股
-          4. 若上述均为 0（持仓本就是 0），则跳过
+          1. target_value>0：目标股数 = int(target_value/price//lot)*lot，
+             卖出量 = total_vol - target_vol（再 cap 到 can_use）
+          2. target_value==0（清仓）：卖出全部可用量
+          3. 若计算结果 < lot 且持仓本身不足一手 → 强制清仓（避免碎股残留）
+          4. 若计算结果 < lot 且持仓充足 → 跳过（差值不足一手）
+          5. 若上述均为 0（持仓本就是 0），则跳过
         """
         # 先撤该股票的旧挂单，避免重复或冲突
         cancelled = self.trader.cancel_orders_for_stock(code)
@@ -804,7 +961,7 @@ class XueqiuFollower:
                     f"但继续执行（旧挂单由 QMT 兜底：可用量校验）"
                 )
 
-        positions = self.trader.get_positions()
+        positions = positions if positions is not None else self.trader.get_positions()
         pos = positions.get(code)
         if pos is None:
             logger.warning(f"卖出 {code}: 账户中无持仓，跳过")
@@ -815,24 +972,44 @@ class XueqiuFollower:
             logger.warning(f"卖出 {code}: 可用股数=0（T+0限制），跳过")
             return "skip"
 
-        # 卖出使用买一价（对手价），确保快速成交
-        price = self.trader.get_bid_price(code)
-        if price is None or price <= 0:
-            price = self.trader.get_latest_price(code)
-        if price is None or price <= 0:
+        # 卖出使用买一价（对手价），确保快速成交；优先用调用方传入的 tick（避免重复查询）
+        if tick is None:
+            tick = self.trader.get_tick(code)
+        if tick:
+            bid_list = tick.get("bidPrice")
+            price = float(bid_list[0]) if bid_list else 0
+            if price <= 0:
+                price = float(tick.get("lastPrice") or 0)
+        else:
+            price = 0
+        if price <= 0:
             price = pos.get("open_price", 0)
         if price <= 0:
             logger.error(f"卖出 {code}: 无法获取价格，跳过")
             return "skip"
 
-        # 跌停保护：跌停时不下卖单（次日再处理）
-        if config.LIMIT_PROTECTION and self.trader.is_limit_down(code):
-            logger.warning(f"【风控-跌停】{code} 当前已跌停，跳过卖出（等下个交易日）")
-            return "skip"
-
-        # 按目标差值计算应卖出股数（向下取整到品种最小交易单位整数倍）
+        # 按目标股数差值法计算卖出量，消除 int(sell_amount/price//lot)*lot 的双重 floor 误差
+        # target_value>0：目标股数 = floor(target_value/price / lot)*lot，卖出量 = total_vol - target_vol
+        # target_value==0（清仓）：卖出全部可用量
         lot = self.trader.get_lot_size(code)
-        sell_volume = int(sell_amount / price // lot) * lot
+        total_vol = int(pos.get("volume") or 0)
+        if target_value > 0:
+            target_vol = int(target_value / price // lot) * lot
+            sell_volume = max(0, total_vol - target_vol)
+            sell_volume = min(sell_volume, can_use)
+        else:
+            sell_volume = can_use
+
+        # 跌停保护：跌停时不下卖单（次日再处理）；tick 已在上方取得，直接复用
+        if config.LIMIT_PROTECTION and self.trader.is_limit_down(code, tick=tick):
+            logger.warning(f"【风控-跌停】{code} 当前已跌停，跳过卖出（等下个交易日）")
+            self._stuck_orders[code] = {
+                "direction": "SELL",
+                "amount":    0,
+                "volume":    sell_volume,
+                "ts":        time.time(),
+            }
+            return "skip"
 
         if sell_volume >= can_use:
             # 超出或等于可用量 → 全部清仓
@@ -874,29 +1051,31 @@ class XueqiuFollower:
         )
         if order_id is not None and order_id > 0:
             self._chase_orders[order_id] = {
-                "stock_code": code,
-                "direction":  "SELL",
-                "amount":     0,
-                "volume":     sell_volume,
-                "ts":         time.time(),
+                "stock_code":    code,
+                "direction":     "SELL",
+                "amount":        0,
+                "volume":        sell_volume,
+                "ts":            time.time(),
+                "chase_count":   0,
+                "initial_price": price,
             }
             return "ok"
         return "fail"
 
     # ─────────────────────────────────────────────────────────
-    # 挂单追踪：30 秒未成交撤单按最新价重下
+    # 挂单追踪：10 秒未成交撤单按最新价重下
     # ─────────────────────────────────────────────────────────
-    _CHASE_INTERVAL = 10   # 检查间隔（秒）：10s未成交即撤单重下对手价
+    _CHASE_INTERVAL = 10
 
     def _chase_unfinished_orders(self):
         """
-        每 30 秒调用一次（仅在交易时间内）：
+        每 10 秒调用一次（仅在交易时间内）：
 
-        1. 遍历 _chase_orders 中超过 30 秒的订单
+        1. 遍历 _chase_orders 中超过 10 秒的订单
         2. 通过 get_pending_orders 判断该 order_id 是否仍在挂单
            - 不在挂单列表 → 已成交或已撤，移出追踪
            - 仍在挂单     → 撤单，按最新价重新下单，用新 order_id 替换追踪记录
-        3. 新下的单同样纳入追踪，下次 30 秒再检查
+        3. 新下的单同样纳入追踪，下次 10 秒再检查
         """
         if not self._chase_orders:
             return
@@ -908,61 +1087,105 @@ class XueqiuFollower:
 
         # 取当前所有未成交委托（一次性查询，减少 QMT 调用次数）
         pending = self.trader.get_pending_orders()          # 全量，不传 stock_code
-        pending_ids = {o["order_id"] for o in pending}
+        pending_map = {o["order_id"]: o for o in pending}  # 用于快速查剩余量
+        pending_ids = set(pending_map.keys())
 
         to_remove: List[int] = []
         to_add:    Dict[int, dict] = {}
 
-        for oid, info in list(self._chase_orders.items()):
-            age = now_ts - info["ts"]
-            if age < self._CHASE_INTERVAL:
-                continue   # 还没到30秒，跳过
+        # 先收集所有需要处理的股票代码，批量查询行情（一次 get_full_ticks 替代 N 次单股查询）
+        overdue_orders = [
+            (oid, info) for oid, info in self._chase_orders.items()
+            if now_ts - info["ts"] >= self._CHASE_INTERVAL
+        ]
+        if not overdue_orders:
+            return
 
-            code = info["stock_code"]
-            direction = info["direction"]
-
+        # 区分：仍在挂单的 vs 已成交的
+        still_pending = [(oid, info) for oid, info in overdue_orders if oid in pending_ids]
+        for oid, info in overdue_orders:
             if oid not in pending_ids:
-                # 已成交或已被撤，移出追踪
-                logger.debug(f"【追单】{code} order_id={oid} 已成交/已撤，移出追踪")
+                logger.debug(f"【追单】{info['stock_code']} order_id={oid} 已成交/已撤，移出追踪")
                 to_remove.append(oid)
+
+        if still_pending:
+            chase_codes = list(set(info["stock_code"] for _, info in still_pending))
+            ticks = self.trader.get_full_ticks(chase_codes) if chase_codes else {}
+
+        max_chase    = getattr(config, "MAX_CHASE_COUNT", 5)
+        max_dev      = getattr(config, "MAX_CHASE_PRICE_DEVIATION", 0.03)
+
+        for oid, info in still_pending:
+            code          = info["stock_code"]
+            direction     = info["direction"]
+            age           = int(now_ts - info["ts"])
+            chase_count   = info.get("chase_count", 0)
+            initial_price = info.get("initial_price", 0)
+
+            to_remove.append(oid)
+
+            # 追单次数上限
+            if chase_count >= max_chase:
+                logger.warning(
+                    f"【追单】{code} {direction} order_id={oid} "
+                    f"已追单 {chase_count} 次，达上限（MAX_CHASE_COUNT={max_chase}），放弃"
+                )
                 continue
 
-            # 仍未成交 → 撤单后按最新价重下
+            # 从批量获取的 tick 中提取对手价（买入用卖一，卖出用买一）
+            tick = ticks.get(code, {})
+            if direction == "BUY":
+                ask_list  = tick.get("askPrice")
+                new_price = float(ask_list[0]) if ask_list else 0
+            else:
+                bid_list  = tick.get("bidPrice")
+                new_price = float(bid_list[0]) if bid_list else 0
+            if new_price <= 0:
+                new_price = float(tick.get("lastPrice") or 0)
+            if new_price <= 0:
+                logger.error(f"【追单】{code} 无法获取价格，放弃重下")
+                continue
+
+            # 价格偏离上限
+            if initial_price > 0 and max_dev > 0:
+                deviation = abs(new_price - initial_price) / initial_price
+                if deviation > max_dev:
+                    logger.warning(
+                        f"【追单】{code} {direction} order_id={oid} "
+                        f"当前价 {new_price:.3f} 偏离初始价 {initial_price:.3f} "
+                        f"达 {deviation*100:.1f}%（上限 {max_dev*100:.0f}%），放弃"
+                    )
+                    continue
+
             logger.info(
                 f"【追单】{code} {direction} order_id={oid} "
-                f"挂单超 {int(age)}s 未成交，撤单重下..."
+                f"挂单超 {age}s 未成交（第{chase_count+1}次追单），撤单重下..."
             )
             cancelled = self.trader.cancel_orders_for_stock(code)
             if cancelled:
                 self.trader.wait_until_all_cancelled(timeout=3.0, stock_code=code)
 
-            to_remove.append(oid)
-
-            # 重新下单：买入用卖一价，卖出用买一价（对手价，确保快速成交）
-            new_price = self.trader.get_ask_price(code) if direction == "BUY" else self.trader.get_bid_price(code)
-            if new_price is None or new_price <= 0:
-                # fallback 到最新价
-                new_price = self.trader.get_latest_price(code)
-            if new_price is None or new_price <= 0:
-                logger.error(f"【追单】{code} 无法获取价格，放弃重下")
-                continue
-
             if direction == "BUY":
-                amount = info["amount"]
-                # 涨停保护
-                if config.LIMIT_PROTECTION and self.trader.is_limit_up(code):
+                # 扣除已部分成交量，只补买剩余未成交量
+                pending_order = pending_map.get(oid, {})
+                traded_vol = int(pending_order.get("traded_volume") or 0)
+                remaining_vol = int(pending_order.get("order_volume") or 0) - traded_vol
+                if remaining_vol <= 0:
+                    logger.debug(f"【追单】{code} BUY order_id={oid} 已全部成交，移出追踪")
+                    continue
+                # 按剩余量重新折算买入金额
+                amount = remaining_vol * new_price
+                if config.LIMIT_PROTECTION and self.trader.is_limit_up(code, tick=tick):
                     logger.warning(f"【追单-风控】{code} 已涨停，放弃重下买入")
                     continue
-                # 预估股数仅用于日志，实际下单以 amount 为准（trader.buy 内部换算）
-                est_volume = self.trader.calc_buy_volume(
-                    amount, new_price, min_lot=self.trader.get_lot_size(code)
-                )
+                lot = self.trader.get_lot_size(code)
+                est_volume = self.trader.calc_buy_volume(amount, new_price, min_lot=lot)
                 if est_volume <= 0:
                     logger.warning(f"【追单】{code} 计算买入股数为0，放弃重下")
                     continue
                 logger.info(
                     f"【追单-重下买入】{code} 约{est_volume}股 @ {new_price:.3f} "
-                    f"（目标金额≈¥{amount:,.0f}）"
+                    f"（剩余未成交={remaining_vol}股，折算金额≈¥{amount:,.0f}）"
                 )
                 new_oid = self.trader.buy(
                     stock_code=code,
@@ -972,21 +1195,26 @@ class XueqiuFollower:
                 )
                 chase_volume = est_volume
             else:  # SELL
-                volume = info["volume"]
-                # 检查可用持仓（持仓可能因部分成交而减少）
+                # 扣除已部分成交量，只补卖剩余未成交量
+                pending_order = pending_map.get(oid, {})
+                traded_vol = int(pending_order.get("traded_volume") or 0)
+                remaining_vol = int(pending_order.get("order_volume") or 0) - traded_vol
+                if remaining_vol <= 0:
+                    logger.debug(f"【追单】{code} SELL order_id={oid} 已全部成交，移出追踪")
+                    continue
                 positions = self.trader.get_positions()
                 pos = positions.get(code)
                 can_use = pos["can_use_volume"] if pos else 0
                 if can_use <= 0:
                     logger.warning(f"【追单】{code} 可用持仓为0，无需重下卖出")
                     continue
-                sell_vol = min(volume, can_use)
-                # 跌停保护
-                if config.LIMIT_PROTECTION and self.trader.is_limit_down(code):
+                sell_vol = min(remaining_vol, can_use)
+                if config.LIMIT_PROTECTION and self.trader.is_limit_down(code, tick=tick):
                     logger.warning(f"【追单-风控】{code} 已跌停，放弃重下卖出")
                     continue
                 logger.info(
-                    f"【追单-重下卖出】{code} {sell_vol}股 @ {new_price:.3f}"
+                    f"【追单-重下卖出】{code} {sell_vol}股 @ {new_price:.3f} "
+                    f"（剩余未成交={remaining_vol}股）"
                 )
                 new_oid = self.trader.sell(
                     stock_code=code,
@@ -994,15 +1222,17 @@ class XueqiuFollower:
                     price=new_price,
                     remark=f"雪球追单卖出-{config.PORTFOLIO_ID}",
                 )
-                chase_volume = volume   # SELL 记录原始目标量
+                chase_volume = remaining_vol
 
             if new_oid is not None and new_oid > 0:
                 to_add[new_oid] = {
-                    "stock_code": code,
-                    "direction":  direction,
-                    "amount":     info["amount"],
-                    "volume":     chase_volume,
-                    "ts":         time.time(),
+                    "stock_code":    code,
+                    "direction":     direction,
+                    "amount":        info["amount"],
+                    "volume":        chase_volume,
+                    "ts":            time.time(),
+                    "chase_count":   chase_count + 1,
+                    "initial_price": initial_price,
                 }
                 logger.info(f"【追单】{code} 新委托 order_id={new_oid}")
             else:
@@ -1046,12 +1276,22 @@ class XueqiuFollower:
             price = self.trader.get_latest_price(code) or price
 
         logger.info(f"执行{action}: {code}({name}) 金额=¥{config.FIXED_AMOUNT:.0f}")
-        self.trader.buy(
+        order_id = self.trader.buy(
             stock_code=code,
             amount=config.FIXED_AMOUNT,
             price=price,
             remark=f"雪球{action}-{config.PORTFOLIO_ID}",
         )
+        if order_id is not None and order_id > 0:
+            self._chase_orders[order_id] = {
+                "stock_code":    code,
+                "direction":     "BUY",
+                "amount":        config.FIXED_AMOUNT,
+                "volume":        0,
+                "ts":            time.time(),
+                "chase_count":   0,
+                "initial_price": self.trader.get_latest_price(code) or 0,
+            }
 
     def _execute_sell_full(self, item: dict, action: str = "卖出"):
         code  = item["stock_code"]
@@ -1063,13 +1303,28 @@ class XueqiuFollower:
                 logger.warning(f"【风控-跌停】{code}({name}) 已跌停，跳过（下个交易日再处理）")
                 return
 
+        # 记录当前可卖量，用于追单追踪
+        positions = self.trader.get_positions()
+        pos = positions.get(code)
+        sell_volume = pos["can_use_volume"] if pos else 0
+
         logger.info(f"执行{action}: {code}({name})")
-        self.trader.sell(
+        order_id = self.trader.sell(
             stock_code=code,
             volume=None,
             price=price,
             remark=f"雪球{action}-{config.PORTFOLIO_ID}",
         )
+        if order_id is not None and order_id > 0 and sell_volume > 0:
+            self._chase_orders[order_id] = {
+                "stock_code":    code,
+                "direction":     "SELL",
+                "amount":        0,
+                "volume":        sell_volume,
+                "ts":            time.time(),
+                "chase_count":   0,
+                "initial_price": self.trader.get_latest_price(code) or 0,
+            }
 
     def _execute_partial_sell(self, item: dict):
         code     = item["stock_code"]
@@ -1096,9 +1351,192 @@ class XueqiuFollower:
         )
 
     # ─────────────────────────────────────────────────────────
+    # 涨跌停卡单：解除后自动重试
+    # ─────────────────────────────────────────────────────────
+    _STUCK_CHECK_INTERVAL = 30
+
+    def _retry_stuck_orders(self):
+        """
+        每 30 秒检查一次因涨停/跌停跳过的订单。
+        涨停/跌停解除后自动重试，避免需要等到下次再平衡触发。
+        """
+        if not self._stuck_orders:
+            return
+        now_ts = time.time()
+        if now_ts - self._last_stuck_check_ts < self._STUCK_CHECK_INTERVAL:
+            return
+        self._last_stuck_check_ts = now_ts
+
+        codes = list(self._stuck_orders.keys())
+        ticks = self.trader.get_full_ticks(codes) if codes else {}
+
+        to_remove = []
+        for code, info in self._stuck_orders.items():
+            tick = ticks.get(code)
+            direction = info["direction"]
+
+            if direction == "BUY":
+                if self.trader.is_limit_up(code, tick=tick):
+                    continue  # 仍涨停，继续等
+                logger.info(f"【卡单重试】{code} 涨停已解除，重新尝试买入 ¥{info['amount']:,.0f}")
+                order_id = self.trader.buy(
+                    stock_code=code,
+                    amount=info["amount"],
+                    price=None,
+                    remark=f"雪球卡单重试-{config.PORTFOLIO_ID}",
+                )
+                if order_id is not None and order_id > 0:
+                    tick_price = float((tick or {}).get("lastPrice") or 0)
+                    self._chase_orders[order_id] = {
+                        "stock_code":    code,
+                        "direction":     "BUY",
+                        "amount":        info["amount"],
+                        "volume":        0,
+                        "ts":            time.time(),
+                        "chase_count":   0,
+                        "initial_price": tick_price,
+                    }
+                to_remove.append(code)
+
+            else:  # SELL
+                if self.trader.is_limit_down(code, tick=tick):
+                    continue  # 仍跌停，继续等
+                logger.info(f"【卡单重试】{code} 跌停已解除，重新尝试卖出")
+                volume = info["volume"] or None  # 0 表示全部卖出
+                order_id = self.trader.sell(
+                    stock_code=code,
+                    volume=volume,
+                    price=None,
+                    remark=f"雪球卡单重试-{config.PORTFOLIO_ID}",
+                )
+                if order_id is not None and order_id > 0:
+                    positions = self.trader.get_positions()
+                    pos = positions.get(code)
+                    sell_vol = pos["can_use_volume"] if pos else (volume or 0)
+                    tick_price = float((tick or {}).get("lastPrice") or 0)
+                    self._chase_orders[order_id] = {
+                        "stock_code":    code,
+                        "direction":     "SELL",
+                        "amount":        0,
+                        "volume":        sell_vol,
+                        "ts":            time.time(),
+                        "chase_count":   0,
+                        "initial_price": tick_price,
+                    }
+                to_remove.append(code)
+
+        for code in to_remove:
+            self._stuck_orders.pop(code, None)
+
+    # ─────────────────────────────────────────────────────────
+    # 等待卖单成交回款
+    # ─────────────────────────────────────────────────────────
+    def _wait_sells_settled(self, sell_codes: List[str], timeout: float = 8.0):
+        """
+        等待指定股票的卖单全部从挂单列表消失（成交或撤单），再继续买入。
+        避免限价卖单尚未成交时，现金尚未到账就开始买入，导致资金不足废单。
+
+        Args:
+            sell_codes: 需要等待的股票代码列表
+            timeout:    最长等待秒数，超时后继续（不阻塞买入，只是现金估计可能偏低）
+        """
+        if not sell_codes:
+            return
+        sell_set = set(sell_codes)
+        interval = 0.5
+        elapsed = 0.0
+        while elapsed < timeout:
+            pending = self.trader.get_pending_orders()
+            pending_sell_codes = {
+                o["stock_code"] for o in pending if o["order_type"] == "SELL"
+            }
+            remaining = sell_set & pending_sell_codes
+            if not remaining:
+                logger.debug(f"卖单已全部成交/撤单，继续执行买入")
+                return
+            logger.debug(
+                f"等待卖单成交回款（{elapsed:.1f}s/{timeout:.0f}s）："
+                f"{', '.join(sorted(remaining))}"
+            )
+            time.sleep(interval)
+            elapsed += interval
+        logger.warning(
+            f"等待卖单成交超时（{timeout:.0f}s），继续买入（现金估计可能偏低）"
+        )
+
+    # ─────────────────────────────────────────────────────────
+    # 钉钉通知
+    # ─────────────────────────────────────────────────────────
+    def _notify_rebalance_done(
+        self,
+        results: List[Tuple[str, str, str]],
+        total_amount: float,
+        actual_cash: float,
+        target_cash: float,
+    ):
+        """
+        再平衡完成后向钉钉机器人发送持仓快照。
+        仅在有成功下单（status=="ok"）时触发，避免无操作时刷屏。
+        """
+        webhook = getattr(config, "DINGTALK_WEBHOOK", "")
+        if not webhook:
+            return
+
+        ok_results = [(c, d) for c, d, s in results if s == "ok"]
+        if not ok_results:
+            return
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [f"【雪球跟单】再平衡完成 {now_str}"]
+        lines.append(f"组合: {config.PORTFOLIO_ID}  账户总资产: ¥{total_amount:,.0f}")
+        lines.append("")
+
+        # 成功下单明细
+        lines.append("本次成交:")
+        for code, direction in ok_results:
+            lines.append(f"  {direction}  {code}")
+
+        # 当前持仓快照
+        lines.append("")
+        lines.append("当前持仓:")
+        try:
+            positions = self.trader.get_positions()
+            if positions:
+                pos_codes = list(positions.keys())
+                ticks = self.trader.get_full_ticks(pos_codes) if pos_codes else {}
+                for code, pos in sorted(positions.items()):
+                    volume = int(pos.get("volume") or 0)
+                    tick = ticks.get(code, {})
+                    price = float(tick.get("lastPrice") or 0) or float(pos.get("open_price") or 0)
+                    mv = price * volume if price > 0 else float(pos.get("market_value") or 0)
+                    pct = mv / total_amount * 100 if total_amount > 0 else 0
+                    lines.append(f"  {code}  {volume}股  市值≈¥{mv:,.0f}  占比{pct:.1f}%")
+            else:
+                lines.append("  （空仓）")
+        except Exception as e:
+            logger.debug(f"钉钉通知：查询持仓失败 {e}")
+
+        lines.append("")
+        lines.append(f"现金: ¥{actual_cash:,.0f}  目标现金: ¥{target_cash:,.0f}")
+
+        text = "\n".join(lines)
+        try:
+            resp = requests.post(
+                webhook,
+                json={"msgtype": "text", "text": {"content": text}},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            logger.info("钉钉通知已发送")
+        except Exception as e:
+            logger.warning(f"钉钉通知发送失败: {e}")
+
+    # ─────────────────────────────────────────────────────────
     # 风控
     # ─────────────────────────────────────────────────────────
-    def _risk_check_buy(self, stock_code: str, amount: float) -> bool:
+    def _risk_check_buy(self, stock_code: str, amount: float,
+                        cash: Optional[float] = None,
+                        total_asset: Optional[float] = None) -> bool:
         if amount > config.MAX_SINGLE_ORDER_AMOUNT:
             logger.warning(
                 f"【风控】单笔金额 ¥{amount:,.0f} > 上限 ¥{config.MAX_SINGLE_ORDER_AMOUNT:,.0f}，拒绝"
@@ -1111,15 +1549,20 @@ class XueqiuFollower:
             )
             return False
 
-        cash  = self.trader.get_cash()
-        total = self.trader.get_total_asset()
-        if total > 0 and cash / total < config.MIN_CASH_RATIO:
+        if cash is None or total_asset is None:
+            _cash, _total = self.trader.get_asset()
+            cash_val  = cash        if cash        is not None else _cash
+            total_val = total_asset if total_asset is not None else _total
+        else:
+            cash_val  = cash
+            total_val = total_asset
+        if total_val > 0 and cash_val / total_val < config.MIN_CASH_RATIO:
             logger.warning(
-                f"【风控】可用资金率 {cash/total*100:.1f}% < 最低 {config.MIN_CASH_RATIO*100:.0f}%，拒绝买入"
+                f"【风控】可用资金率 {cash_val/total_val*100:.1f}% < 最低 {config.MIN_CASH_RATIO*100:.0f}%，拒绝买入"
             )
             return False
-        if cash < amount:
-            logger.warning(f"【风控】可用资金 ¥{cash:,.0f} < 买入金额 ¥{amount:,.0f}，拒绝")
+        if cash_val < amount:
+            logger.warning(f"【风控】可用资金 ¥{cash_val:,.0f} < 买入金额 ¥{amount:,.0f}，拒绝")
             return False
 
         return True
