@@ -6,7 +6,7 @@
 # 1. QMT 交易端配置
 # ────────────────────────────────────────────
 QMT_PATH = r"D:\testnet\userdata_mini"   # ← 改为你的 QMT 安装路径
-ACCOUNT_ID = "xxx"                           # ← 改为你的资金账号
+ACCOUNT_ID = "10107454"                           # ← 改为你的资金账号
 ACCOUNT_TYPE = "STOCK"                              # 普通股票账户
 
 # ────────────────────────────────────────────
@@ -18,7 +18,7 @@ PORTFOLIO_ID = "ZH3605259"                           # ← 改为目标组合 ID
 
 # 雪球 Cookie（登录后从浏览器 DevTools → Network → 任意请求 → Request Headers 获取）
 # 必须填写，否则无法访问组合数据
-XUEQIU_COOKIE = "xq_a_token=f695007a0c1926xxx1721a8d0adb2ee15e1cxxx"       # ← 改为你的雪球 Cookie
+XUEQIU_COOKIE = "xq_a_token=f695007a0c1926ee1721a8d0adb2ee15e1c48959"       # ← 改为你的雪球 Cookie
 
 # ────────────────────────────────────────────
 # 3. 交易策略配置
@@ -67,6 +67,11 @@ TRADE_END_TIME   = "14:55"
 
 # 集合竞价开盘时是否可以下单（09:15~09:25）
 ALLOW_AUCTION = False
+
+# 午间休市时间窗口（此期间不下单，仅轮询雪球通知）
+# 提前收盘日（如节前最后一个交易日）可手动调整
+LUNCH_BREAK_START = "11:30"
+LUNCH_BREAK_END   = "13:00"
 
 # ────────────────────────────────────────────
 # 5. 风控配置
@@ -123,6 +128,6 @@ STATE_FILE = "./state.json"
 
 # ── 可选：告警 Webhook（填写后 Cookie 失效等异常会自动推送）──
 # 钉钉机器人 Webhook（留空则不推送）
-DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=xx"
+DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=d197cbdb74823177f99a6a8d3e84464dadd52345e3ff84dcb9fb9780c8d557bb"
 # 企业微信机器人 Webhook（留空则不推送）
 WECOM_WEBHOOK = ""
