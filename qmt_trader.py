@@ -83,6 +83,35 @@ class _TraderCallback:
 
 
 # ─────────────────────────────────────────────────────────────
+# XtQuantTraderCallback 实现（仅在 xtquant 可用时定义）
+# ─────────────────────────────────────────────────────────────
+if HAS_XTQUANT:
+    class _QMTCallback(XtQuantTraderCallback):
+        """XtQuantTraderCallback 实现，委托给 _TraderCallback。"""
+
+        def __init__(self, trader_ref):
+            self._cb = _TraderCallback(trader_ref)
+
+        def on_disconnected(self):
+            self._cb.on_disconnected()
+
+        def on_stock_order(self, order):
+            self._cb.on_stock_order(order)
+
+        def on_stock_trade(self, trade):
+            self._cb.on_stock_trade(trade)
+
+        def on_order_error(self, order_error):
+            self._cb.on_order_error(order_error)
+
+        def on_cancel_error(self, cancel_error):
+            self._cb.on_cancel_error(cancel_error)
+
+        def on_account_status(self, status):
+            self._cb.on_account_status(status)
+
+
+# ─────────────────────────────────────────────────────────────
 # 主交易类
 # ─────────────────────────────────────────────────────────────
 class QMTTrader:
@@ -111,9 +140,13 @@ class QMTTrader:
         # 当日交易计数
         self._daily_trade_count = 0
 
-        # 重连参数
-        self._reconnect_interval = 30   # 断线后每 30 秒尝试重连一次
-        self._last_reconnect_ts  = 0.0
+        # 重连参数（指数退避）
+        self._reconnect_base_interval = 30    # 首次等待 30s
+        self._reconnect_max_interval  = 300   # 最长等待 5 分钟（上限）
+        self._reconnect_attempts      = 0     # 连续失败次数，成功后归零
+        self._last_reconnect_ts       = 0.0
+        self._session_counter         = 0     # 单调递增，避免同秒重连 session_id 冲突
+        self._on_reconnect_cb         = None  # 重连成功回调，由 follower 注册
 
         # ST 股票名称缓存 {stock_code: (is_st, date_str)}，跨日自动失效
         self._st_cache: Dict[str, tuple] = {}
@@ -135,21 +168,22 @@ class QMTTrader:
             return True
 
         try:
-            session_id = int(time.time() * 1000) % 1000000  # 6位 session id
+            # 先清理旧对象，避免重连时 callback 悬空
+            if self._trader is not None:
+                try:
+                    self._trader.stop()
+                except Exception:
+                    pass
+                self._trader = None
+
+            self._session_counter += 1
+            session_id = self._session_counter
             self._trader = XtQuantTrader(self.qmt_path, session_id)
             self._account = StockAccount(self.account_id, self.account_type)
 
             # 注册回调
             if HAS_XTQUANT:
-                _cb_self = self   # 闭包捕获
-                cb = type("CB", (XtQuantTraderCallback,), {
-                    "on_disconnected":  lambda s: _TraderCallback(_cb_self).on_disconnected() or _cb_self.__setattr__("_connected", False),
-                    "on_stock_order":   _TraderCallback.on_stock_order,
-                    "on_stock_trade":   _TraderCallback.on_stock_trade,
-                    "on_order_error":   _TraderCallback.on_order_error,
-                    "on_cancel_error":  _TraderCallback.on_cancel_error,
-                    "on_account_status":_TraderCallback.on_account_status,
-                })()
+                cb = _QMTCallback(self)
                 self._callback = cb
                 self._trader.register_callback(cb)
 
@@ -895,11 +929,14 @@ class QMTTrader:
 
     def reconnect_if_needed(self) -> bool:
         """
-        若当前连接已断开，尝试重连（有冷却时间保护，避免频繁重连）。
+        若当前连接已断开，按指数退避策略尝试重连。
+
+        退避序列：30s → 60s → 120s → 240s → 300s（上限）
+        重连成功后调用 _on_reconnect_cb（若已注册）。
 
         Returns:
             True  — 当前已连接（无需重连 或 重连成功）
-            False — 仍未连接
+            False — 仍未连接（在冷却期内）
         """
         if self._mock:
             return True
@@ -907,23 +944,48 @@ class QMTTrader:
             return True
 
         now_ts = time.time()
-        if now_ts - self._last_reconnect_ts < self._reconnect_interval:
-            return False   # 还在冷却期
+        wait = self._calc_reconnect_wait()
+        if now_ts - self._last_reconnect_ts < wait:
+            return False
 
         self._last_reconnect_ts = now_ts
-        logger.warning(f"【重连】检测到 QMT 断线，尝试重新连接...")
-
-        # 先清理旧对象
-        try:
-            if self._trader:
-                self._trader.stop()
-        except Exception:
-            pass
-        self._trader = None
+        logger.warning(
+            f"【重连】检测到 QMT 断线，尝试重新连接"
+            f"（第 {self._reconnect_attempts + 1} 次，本次间隔 {wait:.0f}s）..."
+        )
 
         ok = self.connect()
         if ok:
             logger.info("【重连】QMT 重连成功")
+            self._reconnect_attempts = 0
+            if self._on_reconnect_cb is not None:
+                try:
+                    self._on_reconnect_cb()
+                except Exception as e:
+                    logger.error(f"【重连】回调执行异常: {e}")
         else:
-            logger.error("【重连】QMT 重连失败，将在下次循环再试")
+            self._reconnect_attempts += 1
+            next_wait = self._calc_reconnect_wait()
+            logger.error(
+                f"【重连】QMT 重连失败（已失败 {self._reconnect_attempts} 次），"
+                f"{next_wait:.0f}s 后再试"
+            )
         return ok
+
+    def set_reconnect_callback(self, cb) -> None:
+        """注册重连成功回调。重连成功后立即调用，用于清理上层失效的订单追踪状态。"""
+        self._on_reconnect_cb = cb
+
+    def _calc_reconnect_wait(self) -> float:
+        """当前配置的重连等待时间（秒），基于连续失败次数指数退避。"""
+        return min(
+            self._reconnect_base_interval * (2 ** self._reconnect_attempts),
+            self._reconnect_max_interval,
+        )
+
+    def next_reconnect_wait_secs(self) -> float:
+        """返回距下次重连尝试的剩余秒数（0 表示立即可重连）。"""
+        if self._mock or self._connected:
+            return 0.0
+        wait = self._calc_reconnect_wait()
+        return max(0.0, (self._last_reconnect_ts + wait) - time.time())

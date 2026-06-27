@@ -23,20 +23,19 @@ from follower import XueqiuFollower
 
 
 def setup_logging():
-    """配置日志：同时输出到控制台和日志文件"""
+    """配置日志：同时输出到控制台和日志文件（每天零点自动滚动，保留 30 天）"""
+    from logging.handlers import TimedRotatingFileHandler
+
     os.makedirs(config.LOG_DIR, exist_ok=True)
-    today = datetime.datetime.now().strftime("%Y%m%d")
-    log_file = os.path.join(config.LOG_DIR, f"follower_{today}.log")
+    log_path = os.path.join(config.LOG_DIR, "follower.log")
 
     level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
 
-    # 格式
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # 根 logger
     root = logging.getLogger()
     root.setLevel(level)
 
@@ -46,13 +45,18 @@ def setup_logging():
     ch.setFormatter(fmt)
     root.addHandler(ch)
 
-    # 文件 handler
-    fh = logging.FileHandler(log_file, encoding="utf-8")
+    # 文件 handler：每天零点滚动，历史文件名 follower.log.YYYY-MM-DD，保留 30 天
+    fh = TimedRotatingFileHandler(
+        log_path,
+        when="midnight",
+        backupCount=30,
+        encoding="utf-8",
+    )
     fh.setLevel(level)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
-    logging.info(f"日志已初始化，文件: {log_file}")
+    logging.info(f"日志已初始化，文件: {log_path}（每天零点自动滚动）")
 
 
 def check_config():

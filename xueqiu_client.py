@@ -6,13 +6,11 @@ xueqiu_client.py
 功能：
   1. 获取组合当前持仓（positions）
   2. 获取最新调仓记录（rebalancing history）
-  3. 轮询消息通知，检测"组合调仓"推送（低频，避免被反爬）
 
 使用方法：
   client = XueqiuClient(cookie, portfolio_id)
   holdings = client.get_holdings()
   rebalance = client.get_latest_rebalancing()
-  has_new   = client.poll_notification()
 
 ────────────────────────────────────────────────────────────
 【接口说明 - 2025/2026 有效版本】
@@ -310,33 +308,6 @@ class XueqiuClient:
             return result
         except Exception as e:
             logger.error(f"解析调仓记录失败: {e}")
-            return None
-
-    def poll_notification(self, last_known_id: int) -> Optional[dict]:
-        """
-        轮询雪球消息通知，检测是否有新的"组合调仓"推送。
-
-        Args:
-            last_known_id: 已处理的最新调仓 ID（由 follower 的持久化状态提供）
-
-        Returns:
-            dict — 检测到新调仓，直接返回 rebalancing 数据（避免调用方再拉一次）
-            None — 无新通知或获取失败
-        """
-        latest = self.get_latest_rebalancing()
-        if latest is None:
-            return None
-
-        try:
-            latest_id = latest.get("id")
-            if latest_id is None or latest_id == last_known_id:
-                return None
-
-            logger.info(f"检测到 [{self.portfolio_id}] 新调仓！ID={latest_id}")
-            return latest
-
-        except Exception as e:
-            logger.error(f"解析调仓通知失败: {e}")
             return None
 
 
