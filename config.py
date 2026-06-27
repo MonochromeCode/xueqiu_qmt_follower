@@ -111,6 +111,10 @@ SELL_SETTLE_TIMEOUT = 20.0
 # 最大追单次数：同一笔订单追单超过此次数后放弃
 MAX_CHASE_COUNT = 5
 
+# 追单最长持续时间（分钟）：同一笔订单追单超过此时长后放弃
+# 与 MAX_CHASE_COUNT 取先到者，两个条件任一触发则放弃
+MAX_CHASE_MINUTES = 10
+
 # 最大追单价格偏离：当前价相对初始信号价的偏离超过此比例时放弃追单
 # 0.03 表示追到比信号价贵/便宜 3% 就停止，避免追着价格一路跑
 MAX_CHASE_PRICE_DEVIATION = 0.03

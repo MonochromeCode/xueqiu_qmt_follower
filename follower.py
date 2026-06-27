@@ -963,6 +963,7 @@ class XueqiuFollower(OrderChaserMixin):
                 "amount":        amount,
                 "volume":        0,
                 "ts":            time.time(),
+                "start_ts":      time.time(),
                 "chase_count":   0,
                 "initial_price": ask_price,
             }
@@ -1105,6 +1106,7 @@ class XueqiuFollower(OrderChaserMixin):
                 "amount":        0,
                 "volume":        sell_volume,
                 "ts":            time.time(),
+                "start_ts":      time.time(),
                 "chase_count":   0,
                 "initial_price": price,
             }
@@ -1158,6 +1160,7 @@ class XueqiuFollower(OrderChaserMixin):
                 "amount":        config.FIXED_AMOUNT,
                 "volume":        0,
                 "ts":            time.time(),
+                "start_ts":      time.time(),
                 "chase_count":   0,
                 "initial_price": self.trader.get_latest_price(code) or 0,
             }
@@ -1191,6 +1194,7 @@ class XueqiuFollower(OrderChaserMixin):
                 "amount":        0,
                 "volume":        sell_volume,
                 "ts":            time.time(),
+                "start_ts":      time.time(),
                 "chase_count":   0,
                 "initial_price": self.trader.get_latest_price(code) or 0,
             }

@@ -103,6 +103,17 @@ class OrderChaserMixin:
                 )
                 continue
 
+            # 追单时间上限
+            max_minutes = getattr(config, "MAX_CHASE_MINUTES", 10)
+            start_ts = info.get("start_ts", info["ts"])
+            elapsed_min = (now_ts - start_ts) / 60
+            if elapsed_min > max_minutes:
+                logger.warning(
+                    f"【追单】{code} {direction} order_id={oid} "
+                    f"已追单 {elapsed_min:.1f} 分钟，超过上限 {max_minutes} 分钟，放弃"
+                )
+                continue
+
             # 从批量获取的 tick 中提取对手价（买入用卖一，卖出用买一）
             tick = ticks.get(code, {})
             if direction == "BUY":
@@ -202,6 +213,7 @@ class OrderChaserMixin:
                     "amount":        info["amount"],
                     "volume":        chase_volume,
                     "ts":            time.time(),
+                    "start_ts":      info.get("start_ts", info["ts"]),
                     "chase_count":   chase_count + 1,
                     "initial_price": initial_price,
                 }
@@ -261,6 +273,7 @@ class OrderChaserMixin:
                         "amount":        retry_amount,
                         "volume":        0,
                         "ts":            time.time(),
+                        "start_ts":      time.time(),
                         "chase_count":   0,
                         "initial_price": tick_price,
                     }
@@ -288,6 +301,7 @@ class OrderChaserMixin:
                         "amount":        0,
                         "volume":        sell_vol,
                         "ts":            time.time(),
+                        "start_ts":      time.time(),
                         "chase_count":   0,
                         "initial_price": tick_price,
                     }
