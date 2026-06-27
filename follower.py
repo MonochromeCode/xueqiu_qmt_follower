@@ -36,6 +36,7 @@ follower.py
 
 import time
 import json
+import os
 import logging
 import datetime
 import pathlib
@@ -59,16 +60,8 @@ def _now_hhmm() -> str:
 
 
 def _is_trading_day() -> bool:
-    """是否为交易日（排除周末和节假日）"""
-    today = datetime.date.today()
-    # 周末
-    if today.weekday() >= 5:
-        return False
-    # 节假日（在 config.MARKET_HOLIDAYS 中以 'YYYY-MM-DD' 字符串列出）
-    holidays = getattr(config, "MARKET_HOLIDAYS", [])
-    if today.isoformat() in holidays:
-        return False
-    return True
+    """是否为交易日（排除周末）"""
+    return datetime.date.today().weekday() < 5
 
 
 def _is_trade_time() -> bool:
@@ -186,16 +179,16 @@ class XueqiuFollower(OrderChaserMixin):
             logger.warning(f"读取状态文件失败: {e}，将从头开始")
 
     def _save_state(self):
-        """将当前关键状态写入磁盘"""
+        """将当前关键状态写入磁盘（原子写入，防止断电截断）"""
         try:
             data = {
                 "last_rebalancing_id": self._last_rebalancing_id,
                 "pending_rebalance":   self._pending_rebalance,
             }
-            self._state_file.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            content = json.dumps(data, ensure_ascii=False, indent=2)
+            tmp_path = str(self._state_file) + ".tmp"
+            pathlib.Path(tmp_path).write_text(content, encoding="utf-8")
+            os.replace(tmp_path, self._state_file)
         except Exception as e:
             logger.warning(f"保存状态文件失败: {e}")
 
@@ -834,6 +827,8 @@ class XueqiuFollower(OrderChaserMixin):
                     tick=fresh_ticks.get(code),
                 )
                 results.append((code, "买入", status))
+                if status == "ok":
+                    available_cash -= buy_amount
 
         # ── 5. 执行结果汇总 ─────────────────────────────────
         if results:

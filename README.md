@@ -11,12 +11,14 @@ xueqiu_qmt_follower/
 ├── config.py          # 配置文件（必须修改）
 ├── xueqiu_client.py   # 雪球数据获取模块
 ├── qmt_trader.py      # miniQMT 交易执行模块
-├── follower.py        # 跟踪主逻辑
+├── follower.py        # 跟踪主逻辑（轮询、再平衡、开盘处理）
+├── order_chaser.py    # 追单 / 涨跌停卡单重试 Mixin
+├── notifier.py        # 钉钉再平衡完成通知
 ├── main.py            # 程序入口
 ├── state.json         # 运行状态持久化（自动生成）
 ├── check_update.py    # 诊断：验证雪球调仓检测
 ├── test_api.py        # 诊断：探测雪球接口存活
-└── logs/              # 运行日志（自动创建）
+└── logs/              # 运行日志（自动创建，每日零点滚动）
 ```
 
 ---
@@ -67,6 +69,8 @@ python main.py
 
 xtquant 无法导入时自动进入**模拟模式**——所有交易指令只打印日志，不实际下单。
 
+日志写入 `./logs/follower.log`，每天零点自动滚动，保留 30 天。
+
 ---
 
 ## 跟单模式
@@ -98,6 +102,12 @@ REBALANCE_THRESHOLD     = 0.02    # 相对偏差门槛（2%）
 REBALANCE_ABS_THRESHOLD = 200.0   # 绝对金额门槛（元）
 SELL_SETTLE_TIMEOUT     = 8.0     # 等待卖单回款最长秒数
 TOTAL_AMOUNT            = ...     # 仅作 fallback，正常情况不生效
+
+# 交易时间控制
+TRADE_START_TIME        = "09:30"
+TRADE_END_TIME          = "14:55"
+LUNCH_BREAK_START       = "11:30" # 午休开始（此段时间不下单）
+LUNCH_BREAK_END         = "13:00" # 午休结束
 ```
 
 ### fixed_amount（旧模式）
@@ -111,10 +121,11 @@ TOTAL_AMOUNT            = ...     # 仅作 fallback，正常情况不生效
 ```
 主循环（每 POLL_INTERVAL_SECONDS 秒，每次只拉一次雪球接口）
   ├─ 断线重连检测
-  ├─ 非交易时间
+  ├─ 交易日判断（周末直接跳过）
+  ├─ 非交易时间（含午休 11:30–13:00）
   │    └─ 每 OFFHOUR_CANCEL_INTERVAL 秒检查雪球调仓 ID
   │         ID 变化 → 撤销 QMT 全部挂单 → 标记 pending_rebalance
-  └─ 交易时间
+  └─ 交易时间（09:30–11:30、13:00–14:55）
        ├─ pending_rebalance=True
        │    └─ 等待 OPEN_COOLDOWN_SECONDS 冷静期 → 执行再平衡 → 清除标记
        ├─ 检测到新调仓通知 或 5 分钟兜底定时检查
@@ -197,6 +208,7 @@ TOTAL_AMOUNT            = ...     # 仅作 fallback，正常情况不生效
 3. **雪球 API 为非官方接口，可能随时变更**；`test_api.py` 可用于快速探测接口存活状态
 4. **实盘使用前请先在模拟账号充分验证**
 5. A 股（SH / SZ / BJ）及可转债均支持；港股代码可解析但未经实盘验证
+
 
 ---
 
